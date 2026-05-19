@@ -25,6 +25,34 @@ Prefer one `apply-json` payload per logical change. Use a `commands` transaction
 
 If `excalidraw-room skill` prints an update notice, tell the user a newer CLI exists before relying on version-sensitive behavior. Do not update the global CLI without explicit user approval.
 
+## Self-hosted Excalidraw
+
+If the user needs a self-hosted Excalidraw domain, configure it once:
+
+```bash
+excalidraw-room config set-app-url https://excalidraw.example.com
+```
+
+After that, `create-room --json` returns room URLs on that domain. A one-off command also works and saves the domain:
+
+```bash
+excalidraw-room create-room --json --app-url https://excalidraw.example.com
+```
+
+If the deployment requires HTTP Basic Auth, configure credentials locally. Prefer environment variables when the password should not be visible in shell history:
+
+```bash
+EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD='...' excalidraw-room config set-basic-auth "$EXCALIDRAW_USER"
+```
+
+If the self-hosted app uses a custom Socket.IO collab server:
+
+```bash
+excalidraw-room config set-ws-server-url https://collab.example.com
+```
+
+`config show` redacts the stored password. Do not put domains, room URLs, usernames, or passwords into committed files unless the user explicitly asks and the values are public.
+
 ## Create path
 
 If the user asks you to make a new room or does not provide a room URL, use:
@@ -238,6 +266,7 @@ excalidraw-room export-image '<roomUrl>' /tmp/one.png --crop-element <id> --padd
 
 ```bash
 excalidraw-room version
+excalidraw-room config show
 excalidraw-room create-room --json
 excalidraw-room skills list
 excalidraw-room skills get core

@@ -37,6 +37,54 @@ excalidraw-room help
 excalidraw-room version
 ```
 
+## Self-hosted Excalidraw
+
+Configure a custom Excalidraw app URL once:
+
+```bash
+excalidraw-room config set-app-url https://excalidraw.example.com
+```
+
+Then `create-room` will return room URLs on that domain. You can also set it while creating a room; the URL is saved to the global CLI config:
+
+```bash
+excalidraw-room create-room --json --app-url https://excalidraw.example.com
+```
+
+If your deployment or collab endpoint is behind HTTP Basic Auth, configure credentials locally:
+
+```bash
+excalidraw-room config set-basic-auth "$EXCALIDRAW_USER" "$EXCALIDRAW_PASSWORD"
+```
+
+The password is stored only in `~/.excalidraw-room-cli/config.json` with file mode `0600`, and `config show` redacts it. To avoid shell history, set `EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD` and omit the password argument:
+
+```bash
+EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD='...' excalidraw-room config set-basic-auth "$EXCALIDRAW_USER"
+```
+
+If your self-hosted app uses a custom Socket.IO collaboration server, set it too:
+
+```bash
+excalidraw-room config set-ws-server-url https://collab.example.com
+```
+
+Per-command overrides are also supported and saved to the global config when provided:
+
+```bash
+excalidraw-room create-room --json --domain https://excalidraw.example.com
+excalidraw-room apply-json "$ROOM_URL" --basic-auth "$EXCALIDRAW_USER:$EXCALIDRAW_PASSWORD" <<'JSON'
+{ "command": "elements.add", "ops": [] }
+JSON
+```
+
+Environment overrides are available for automation:
+
+- `EXCALIDRAW_ROOM_APP_URL`
+- `EXCALIDRAW_ROOM_WS_SERVER_URL`
+- `EXCALIDRAW_ROOM_BASIC_AUTH=user:password`
+- `EXCALIDRAW_ROOM_BASIC_AUTH_USER` and `EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD`
+
 ## Quick Start
 
 Create a new shared room:
@@ -98,7 +146,8 @@ excalidraw-room export-image "$ROOM_URL" room.svg
 ```bash
 excalidraw-room help
 excalidraw-room version
-excalidraw-room create-room [--json]
+excalidraw-room config show
+excalidraw-room create-room [--json] [--app-url <url>] [--ws-server-url <url>] [--basic-auth <user:password>]
 excalidraw-room status <roomUrl>
 excalidraw-room dump <roomUrl> [out.json]
 excalidraw-room watch <roomUrl>
@@ -137,6 +186,8 @@ Creates an empty shared Excalidraw room and prints:
 - `roomId`
 - `roomKey`
 - `roomUrl`
+
+The `roomUrl` uses the configured app URL. Set it globally with `config set-app-url` or for this command with `--app-url` / `--domain`.
 
 Use `--json` when another tool needs to consume the result:
 

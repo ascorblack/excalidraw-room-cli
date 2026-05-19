@@ -7,6 +7,7 @@ import path from "node:path";
 type RoomRef = {
   roomId: string;
   roomKey: string;
+  appUrl?: string;
 };
 
 type CreatedRoom = RoomRef & {
@@ -132,6 +133,24 @@ type UpdateStatus = {
   isOutdated: boolean;
 };
 
+type BasicAuthConfig = {
+  username: string;
+  password: string;
+};
+
+type CliConfig = {
+  appUrl?: string;
+  wsServerUrl?: string;
+  basicAuth?: BasicAuthConfig;
+};
+
+type RuntimeConfig = {
+  appUrl: string;
+  wsServerUrl: string;
+  socketOrigin: string;
+  basicAuth: BasicAuthConfig | null;
+};
+
 type AddRectSpec = {
   type: "addRect";
   x: number;
@@ -228,8 +247,8 @@ type ApplyJsonInput = LegacyApplyJsonSpec | ApplyJsonCommand | ApplyJsonTransact
 
 const FIREBASE_API_KEY = "AIzaSyAd15pYlMci_xIp9ko6wkEsDzAAA0Dn0RU";
 const FIREBASE_PROJECT_ID = "excalidraw-room-persistence";
-const WS_SERVER_URL = "https://oss-collab.excalidraw.com";
-const EXCALIDRAW_APP_URL = "https://excalidraw.com";
+const DEFAULT_WS_SERVER_URL = "https://oss-collab.excalidraw.com";
+const DEFAULT_EXCALIDRAW_APP_URL = "https://excalidraw.com";
 const ROOM_ID_BYTES = 15;
 const ROOM_KEY_BYTES = 16;
 const DEFAULT_FONT_FAMILY = 1;
@@ -238,6 +257,7 @@ const CLI_BIN_NAME = "excalidraw-room";
 const CLI_PACKAGE_NAME = "excalidraw-room-cli";
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..");
 const APP_HOME = path.join(os.homedir(), ".excalidraw-room-cli");
+const CONFIG_PATH = path.join(APP_HOME, "config.json");
 const CACHE_DIR = path.join(APP_HOME, "cache");
 const SNAPSHOTS_DIR = path.join(APP_HOME, "snapshots");
 const SKILLS_DIR = path.join(PACKAGE_ROOT, "skills");
@@ -258,8 +278,9 @@ Main commands:
   ${CLI_BIN_NAME} help
   ${CLI_BIN_NAME} version
   ${CLI_BIN_NAME} skill
+  ${CLI_BIN_NAME} config [show|path|set-app-url|set-ws-server-url|set-basic-auth|clear-basic-auth]
   ${CLI_BIN_NAME} setup [--claude|--codex|--cursor|--universal|--all-agents]
-  ${CLI_BIN_NAME} create-room [--json]
+  ${CLI_BIN_NAME} create-room [--json] [--app-url <url>] [--ws-server-url <url>] [--basic-auth <user:password>]
   ${CLI_BIN_NAME} status <roomUrl>
   ${CLI_BIN_NAME} dump <roomUrl> [out.json]
   ${CLI_BIN_NAME} watch <roomUrl>
@@ -274,6 +295,20 @@ Recommended flow:
   2. Read current state with status / dump / snapshot
   3. Apply JSON operations with apply-json
   4. Export PNG/SVG with export-image
+
+Self-hosted Excalidraw:
+  ${CLI_BIN_NAME} config set-app-url https://excalidraw.example.com
+  ${CLI_BIN_NAME} config set-basic-auth <user> <password>
+  ${CLI_BIN_NAME} config set-ws-server-url https://collab.example.com
+  ${CLI_BIN_NAME} create-room --json
+
+Per-command overrides:
+  --app-url <url>          Excalidraw app URL for generated room URLs and websocket Origin
+  --domain <url>           Alias for --app-url
+  --ws-server-url <url>    Socket.IO collaboration server URL
+  --basic-auth <u:p>       Basic Auth for websocket requests; saved to the global config
+  --basic-auth-user <u>    Basic Auth username
+  --basic-auth-password <p> Basic Auth password
 
 apply-json input:
   - file path: apply-json <roomUrl> spec.json
@@ -437,6 +472,187 @@ function parseOptionalStringFlag(args: string[], flag: string): string | null {
   return args[index + 1];
 }
 
+const RUNTIME_VALUE_FLAGS = new Set([
+  "--app-url",
+  "--domain",
+  "--ws-server-url",
+  "--basic-auth",
+  "--basic-auth-user",
+  "--basic-auth-password",
+]);
+
+function positionalArgs(args: string[]): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (RUNTIME_VALUE_FLAGS.has(value)) {
+      index += 1;
+      continue;
+    }
+    values.push(value);
+  }
+  return values;
+}
+
+function normalizeBaseUrl(value: string, name: string): string {
+  const raw = value.includes("://") ? value : `https://${value}`;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${name} must use http or https`);
+  }
+  url.search = "";
+  url.hash = "";
+  const normalized = url.toString().replace(/\/$/, "");
+  return normalized;
+}
+
+function normalizeAppUrl(value: string): string {
+  return normalizeBaseUrl(value, "app URL");
+}
+
+function normalizeWsServerUrl(value: string): string {
+  return normalizeBaseUrl(value, "websocket server URL");
+}
+
+async function readCliConfig(): Promise<CliConfig> {
+  if (!(await Bun.file(CONFIG_PATH).exists())) {
+    return {};
+  }
+  const parsed = JSON.parse(await Bun.file(CONFIG_PATH).text()) as CliConfig;
+  return sanitizeCliConfig(parsed);
+}
+
+async function writeCliConfig(config: CliConfig): Promise<void> {
+  await fs.mkdir(APP_HOME, { recursive: true });
+  await fs.writeFile(CONFIG_PATH, `${JSON.stringify(sanitizeCliConfig(config), null, 2)}\n`, "utf8");
+  await fs.chmod(CONFIG_PATH, 0o600);
+}
+
+function sanitizeCliConfig(config: CliConfig): CliConfig {
+  const next: CliConfig = {};
+  if (config.appUrl) {
+    next.appUrl = normalizeAppUrl(config.appUrl);
+  }
+  if (config.wsServerUrl) {
+    next.wsServerUrl = normalizeWsServerUrl(config.wsServerUrl);
+  }
+  if (config.basicAuth) {
+    next.basicAuth = normalizeBasicAuth(config.basicAuth.username, config.basicAuth.password);
+  }
+  return next;
+}
+
+function redactConfig(config: CliConfig): CliConfig {
+  return {
+    ...config,
+    basicAuth: config.basicAuth
+      ? {
+          username: config.basicAuth.username,
+          password: "<redacted>",
+        }
+      : undefined,
+  };
+}
+
+function normalizeBasicAuth(username: string, password: string): BasicAuthConfig {
+  if (!username) {
+    throw new Error("Basic Auth username must be non-empty");
+  }
+  if (!password) {
+    throw new Error("Basic Auth password must be non-empty");
+  }
+  return { username, password };
+}
+
+function parseBasicAuthPair(value: string): BasicAuthConfig {
+  const separator = value.indexOf(":");
+  if (separator <= 0) {
+    throw new Error("Basic Auth must use user:password format");
+  }
+  return normalizeBasicAuth(value.slice(0, separator), value.slice(separator + 1));
+}
+
+function basicAuthFromArgs(args: string[]): BasicAuthConfig | null {
+  const pair = parseOptionalStringFlag(args, "--basic-auth");
+  if (pair) {
+    return parseBasicAuthPair(pair);
+  }
+
+  const username = parseOptionalStringFlag(args, "--basic-auth-user");
+  if (!username) {
+    return null;
+  }
+  const password = parseOptionalStringFlag(args, "--basic-auth-password") ?? process.env.EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD;
+  if (!password) {
+    throw new Error("Missing --basic-auth-password or EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD");
+  }
+  return normalizeBasicAuth(username, password);
+}
+
+function basicAuthFromEnv(): BasicAuthConfig | null {
+  if (process.env.EXCALIDRAW_ROOM_BASIC_AUTH) {
+    return parseBasicAuthPair(process.env.EXCALIDRAW_ROOM_BASIC_AUTH);
+  }
+  const username = process.env.EXCALIDRAW_ROOM_BASIC_AUTH_USER;
+  const password = process.env.EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD;
+  if (!username && !password) {
+    return null;
+  }
+  if (!username || !password) {
+    throw new Error("Set both EXCALIDRAW_ROOM_BASIC_AUTH_USER and EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD");
+  }
+  return normalizeBasicAuth(username, password);
+}
+
+async function resolveRuntimeConfig(args: string[], roomAppUrl?: string): Promise<RuntimeConfig> {
+  const fileConfig = await readCliConfig();
+  const argAppUrl = parseOptionalStringFlag(args, "--app-url") ?? parseOptionalStringFlag(args, "--domain");
+  const argWsServerUrl = parseOptionalStringFlag(args, "--ws-server-url");
+  const argBasicAuth = basicAuthFromArgs(args);
+  const envBasicAuth = argBasicAuth ? null : basicAuthFromEnv();
+
+  const appUrl = normalizeAppUrl(
+    argAppUrl ??
+      process.env.EXCALIDRAW_ROOM_APP_URL ??
+      roomAppUrl ??
+      fileConfig.appUrl ??
+      DEFAULT_EXCALIDRAW_APP_URL,
+  );
+  const wsServerUrl = normalizeWsServerUrl(
+    argWsServerUrl ?? process.env.EXCALIDRAW_ROOM_WS_SERVER_URL ?? fileConfig.wsServerUrl ?? DEFAULT_WS_SERVER_URL,
+  );
+  const socketOrigin =
+    wsServerUrl === DEFAULT_WS_SERVER_URL
+      ? new URL(DEFAULT_EXCALIDRAW_APP_URL).origin
+      : new URL(appUrl).origin;
+  const basicAuth = argBasicAuth ?? envBasicAuth ?? fileConfig.basicAuth ?? null;
+
+  if (argAppUrl || argWsServerUrl || argBasicAuth) {
+    await writeCliConfig({
+      ...fileConfig,
+      ...(argAppUrl ? { appUrl } : {}),
+      ...(argWsServerUrl ? { wsServerUrl } : {}),
+      ...(argBasicAuth ? { basicAuth: argBasicAuth } : {}),
+    });
+  }
+
+  return {
+    appUrl,
+    wsServerUrl,
+    socketOrigin,
+    basicAuth,
+  };
+}
+
+function basicAuthHeader(credentials: BasicAuthConfig): string {
+  return `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
+}
+
 function defaultSkillInstallDirs(): string[] {
   return [
     skillInstallDirForAgent("codex"),
@@ -496,12 +712,18 @@ function resolveSkillInstallTargets(args: string[]): string[] {
 }
 
 function parseRoomUrl(roomUrl: string): RoomRef {
-  const hash = new URL(roomUrl).hash;
+  const url = new URL(roomUrl);
+  const hash = url.hash;
   const match = hash.match(/^#room=([a-zA-Z0-9_-]+),([a-zA-Z0-9_-]+)$/);
   if (!match) {
     throw new Error("Invalid room URL");
   }
-  return { roomId: match[1], roomKey: match[2] };
+  const pathname = url.pathname === "/" ? "" : url.pathname;
+  return {
+    roomId: match[1],
+    roomKey: match[2],
+    appUrl: normalizeAppUrl(`${url.origin}${pathname}`),
+  };
 }
 
 function randomBase64Url(byteLength: number): string {
@@ -509,18 +731,19 @@ function randomBase64Url(byteLength: number): string {
   return Buffer.from(bytes).toString("base64url");
 }
 
-function formatRoomUrl(room: RoomRef): string {
-  return `${EXCALIDRAW_APP_URL}/#room=${room.roomId},${room.roomKey}`;
+function formatRoomUrl(room: RoomRef, appUrl: string): string {
+  return `${normalizeAppUrl(appUrl)}/#room=${room.roomId},${room.roomKey}`;
 }
 
-function createRoomRef(): CreatedRoom {
+function createRoomRef(config: RuntimeConfig): CreatedRoom {
   const room = {
     roomId: randomBase64Url(ROOM_ID_BYTES),
     roomKey: randomBase64Url(ROOM_KEY_BYTES),
+    appUrl: config.appUrl,
   };
   return {
     ...room,
-    roomUrl: formatRoomUrl(room),
+    roomUrl: formatRoomUrl(room, config.appUrl),
   };
 }
 
@@ -555,7 +778,7 @@ async function encryptJson(roomKey: string, value: unknown): Promise<{ ciphertex
   const key = await importAesKey(roomKey, "encrypt");
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = encoder.encode(JSON.stringify(value));
-  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as BufferSource }, key, plaintext);
   return {
     ciphertext: new Uint8Array(encrypted),
     iv,
@@ -564,7 +787,11 @@ async function encryptJson(roomKey: string, value: unknown): Promise<{ ciphertex
 
 async function decryptBytes(roomKey: string, iv: Uint8Array, ciphertext: Uint8Array): Promise<string> {
   const key = await importAesKey(roomKey, "decrypt");
-  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv as BufferSource },
+    key,
+    ciphertext as BufferSource,
+  );
   return decoder.decode(new Uint8Array(decrypted));
 }
 
@@ -740,6 +967,7 @@ function createText(args: {
       roughness: 0,
       index: args.index,
     }),
+    type: "text",
     text: args.text,
     fontSize,
     fontFamily: args.fontFamily ?? DEFAULT_FONT_FAMILY,
@@ -802,6 +1030,7 @@ function createArrow(args: {
       backgroundColor: "transparent",
       index: args.index,
     }),
+    type: "arrow",
     points: [
       [0, 0],
       [args.end.x - args.start.x, args.end.y - args.start.y],
@@ -832,14 +1061,19 @@ function appendBoundElement(target: ExcalidrawElement, ref: BoundElementRef): Ex
   return touchElement(target, { boundElements });
 }
 
-async function joinRoomSocket(room: RoomRef): Promise<Socket> {
-  const socket = io(WS_SERVER_URL, {
+async function joinRoomSocket(room: RoomRef, config: RuntimeConfig): Promise<Socket> {
+  const extraHeaders: Record<string, string> = {
+    Origin: config.socketOrigin,
+    "User-Agent": "Mozilla/5.0",
+  };
+  if (config.basicAuth && config.wsServerUrl !== DEFAULT_WS_SERVER_URL) {
+    extraHeaders.Authorization = basicAuthHeader(config.basicAuth);
+  }
+
+  const socket = io(config.wsServerUrl, {
     transports: ["websocket"],
     forceNew: true,
-    extraHeaders: {
-      Origin: "https://excalidraw.com",
-      "User-Agent": "Mozilla/5.0",
-    },
+    extraHeaders,
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -877,8 +1111,8 @@ async function encryptSocketPayload(roomKey: string, payload: SocketUpdate): Pro
   return { encrypted: new Uint8Array(encrypted), iv };
 }
 
-async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement[]): Promise<void> {
-  const socket = await joinRoomSocket(room);
+async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement[], config: RuntimeConfig): Promise<void> {
+  const socket = await joinRoomSocket(room, config);
   try {
     const { encrypted, iv } = await encryptSocketPayload(room.roomKey, {
       type: "SCENE_UPDATE",
@@ -891,9 +1125,9 @@ async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement
   }
 }
 
-async function persistChange(room: RoomRef, change: SceneChange): Promise<void> {
+async function persistChange(room: RoomRef, change: SceneChange, config: RuntimeConfig): Promise<void> {
   await writeScene(room, change.next);
-  await broadcastUpdate(room, change.changed);
+  await broadcastUpdate(room, change.changed, config);
   console.log(change.summary);
 }
 
@@ -1071,8 +1305,9 @@ function getElementBounds(element: ExcalidrawElement): ElementBounds {
   const xs = [element.x, element.x + (element.width ?? 0)];
   const ys = [element.y, element.y + (element.height ?? 0)];
 
-  if (Array.isArray((element as { points?: unknown }).points)) {
-    for (const point of (element as { points: unknown[] }).points) {
+  const points = (element as unknown as { points?: unknown }).points;
+  if (Array.isArray(points)) {
+    for (const point of points) {
       if (Array.isArray(point) && point.length >= 2) {
         xs.push(element.x + Number(point[0]));
         ys.push(element.y + Number(point[1]));
@@ -1605,9 +1840,75 @@ function applyJsonCommand(
   }
 }
 
+async function commandConfig(args: string[]): Promise<void> {
+  const [subcommand = "show", ...rest] = args;
+  const config = await readCliConfig();
+
+  switch (subcommand) {
+    case "show":
+      console.log(JSON.stringify(redactConfig(config), null, 2));
+      return;
+    case "path":
+      console.log(CONFIG_PATH);
+      return;
+    case "set-app-url":
+    case "set-domain": {
+      const appUrl = rest[0];
+      if (!appUrl) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config ${subcommand} <url>`);
+      }
+      const next = { ...config, appUrl: normalizeAppUrl(appUrl) };
+      await writeCliConfig(next);
+      console.log(`Saved appUrl ${next.appUrl}`);
+      return;
+    }
+    case "set-ws-server-url": {
+      const wsServerUrl = rest[0];
+      if (!wsServerUrl) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config set-ws-server-url <url>`);
+      }
+      const next = { ...config, wsServerUrl: normalizeWsServerUrl(wsServerUrl) };
+      await writeCliConfig(next);
+      console.log(`Saved wsServerUrl ${next.wsServerUrl}`);
+      return;
+    }
+    case "set-basic-auth": {
+      const usernameOrPair = rest[0];
+      if (!usernameOrPair) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config set-basic-auth <user> [password]`);
+      }
+      const basicAuth =
+        rest.length === 1 && usernameOrPair.includes(":")
+          ? parseBasicAuthPair(usernameOrPair)
+          : normalizeBasicAuth(usernameOrPair, rest[1] ?? process.env.EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD ?? "");
+      const next = { ...config, basicAuth };
+      await writeCliConfig(next);
+      console.log(`Saved Basic Auth username ${basicAuth.username}`);
+      return;
+    }
+    case "clear-basic-auth": {
+      const next = { ...config };
+      delete next.basicAuth;
+      await writeCliConfig(next);
+      console.log("Cleared Basic Auth");
+      return;
+    }
+    case "reset":
+      await fs.rm(CONFIG_PATH, { force: true });
+      console.log(`Removed ${CONFIG_PATH}`);
+      return;
+    default:
+      throw new Error(
+        `Usage: ${CLI_BIN_NAME} config [show|path|set-app-url|set-ws-server-url|set-basic-auth|clear-basic-auth|reset]`,
+      );
+  }
+}
+
 async function commandDump(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const outPath = args[1];
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  await resolveRuntimeConfig(args, room.appUrl);
+  const outPath = values[1];
   const elements = await readScene(room);
   const json = JSON.stringify({ elements }, null, 2);
   if (outPath) {
@@ -1619,7 +1920,9 @@ async function commandDump(args: string[]): Promise<void> {
 }
 
 async function commandStatus(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  await resolveRuntimeConfig(args, room.appUrl);
   const elements = await readScene(room);
   const live = elements.filter((element) => !element.isDeleted);
   console.log(summarizeScene(elements));
@@ -1633,7 +1936,8 @@ async function commandStatus(args: string[]): Promise<void> {
 }
 
 async function commandCreateRoom(args: string[]): Promise<void> {
-  const room = createRoomRef();
+  const config = await resolveRuntimeConfig(args);
+  const room = createRoomRef(config);
   await writeScene(room, []);
   if (args.includes("--json")) {
     console.log(JSON.stringify(room, null, 2));
@@ -1645,11 +1949,13 @@ async function commandCreateRoom(args: string[]): Promise<void> {
 }
 
 async function commandWatch(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  const config = await resolveRuntimeConfig(args, room.appUrl);
   const initial = await readScene(room);
   console.log(`Initial scene: ${initial.length} elements`);
 
-  const socket = await joinRoomSocket(room);
+  const socket = await joinRoomSocket(room, config);
   socket.on("client-broadcast", async (encryptedData: ArrayBuffer, iv: Uint8Array) => {
     try {
       const json = await decryptBytes(room.roomKey, iv, new Uint8Array(encryptedData));
@@ -1663,8 +1969,10 @@ async function commandWatch(args: string[]): Promise<void> {
 }
 
 async function commandSnapshot(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const outPath = args[1] ?? snapshotDefaultPath(room);
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  await resolveRuntimeConfig(args, room.appUrl);
+  const outPath = values[1] ?? snapshotDefaultPath(room);
   const elements = await readScene(room);
   await Bun.$`mkdir -p ${path.dirname(outPath)}`.quiet();
   await Bun.write(outPath, JSON.stringify({ roomId: room.roomId, elements }, null, 2));
@@ -1672,8 +1980,10 @@ async function commandSnapshot(args: string[]): Promise<void> {
 }
 
 async function commandRestore(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const filePath = args[1];
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  const config = await resolveRuntimeConfig(args, room.appUrl);
+  const filePath = values[1];
   if (!filePath) {
     usage();
   }
@@ -1681,7 +1991,7 @@ async function commandRestore(args: string[]): Promise<void> {
   const elements = normalizeElementsFile(input);
   const current = await readScene(room);
   const change = buildReplaceScene(current, elements);
-  await persistChange(room, { ...change, summary: `Restored ${elements.length} elements from ${filePath}` });
+  await persistChange(room, { ...change, summary: `Restored ${elements.length} elements from ${filePath}` }, config);
 }
 
 async function commandVersion(): Promise<void> {
@@ -1751,8 +2061,10 @@ async function commandSetup(args: string[]): Promise<void> {
 }
 
 async function commandSendFile(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const filePath = args[1];
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  const config = await resolveRuntimeConfig(args, room.appUrl);
+  const filePath = values[1];
   if (!filePath) {
     usage();
   }
@@ -1761,15 +2073,15 @@ async function commandSendFile(args: string[]): Promise<void> {
   const incoming = normalizeElementsFile(input);
   const current = await readScene(room);
   if (mode === "replace") {
-    await persistChange(room, { ...buildReplaceScene(current, incoming), summary: `Sent ${incoming.length} elements with mode=replace` });
+    await persistChange(room, { ...buildReplaceScene(current, incoming), summary: `Sent ${incoming.length} elements with mode=replace` }, config);
     return;
   }
   await writeScene(room, [...current, ...incoming]);
-  await broadcastUpdate(room, incoming);
+  await broadcastUpdate(room, incoming, config);
   console.log(`Sent ${incoming.length} elements with mode=append`);
 }
 
-async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput): Promise<void> {
+async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: RuntimeConfig): Promise<void> {
   const current = await readScene(room);
   let scene = current;
   let changed: ExcalidrawElement[] = [];
@@ -1833,19 +2145,21 @@ async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput): Promise<void
   }
 
   await writeScene(room, scene);
-  await broadcastUpdate(room, changed.length > 0 ? changed : scene);
+  await broadcastUpdate(room, changed.length > 0 ? changed : scene, config);
   console.log(summaries.join("; "));
 }
 
 async function commandApplyJson(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const source = args[1];
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  const config = await resolveRuntimeConfig(args, room.appUrl);
+  const source = values[1];
   const raw = await readJsonInput(source);
   if (!raw.trim()) {
     throw new Error("Empty JSON input");
   }
   const input = JSON.parse(raw) as ApplyJsonInput;
-  await applyJsonSpec(room, input);
+  await applyJsonSpec(room, input, config);
 }
 
 async function commandApplySpec(args: string[]): Promise<void> {
@@ -1853,8 +2167,10 @@ async function commandApplySpec(args: string[]): Promise<void> {
 }
 
 async function commandExportImage(args: string[]): Promise<void> {
-  const room = parseRoomUrl(args[0] ?? usage());
-  const outPath = args[1];
+  const values = positionalArgs(args);
+  const room = parseRoomUrl(values[0] ?? usage());
+  await resolveRuntimeConfig(args, room.appUrl);
+  const outPath = values[1];
   if (!outPath) {
     usage();
   }
@@ -1897,6 +2213,9 @@ async function main(): Promise<void> {
       return;
     case "skills":
       await commandSkills(rest);
+      return;
+    case "config":
+      await commandConfig(rest);
       return;
     case "create-room":
       await commandCreateRoom(rest);
