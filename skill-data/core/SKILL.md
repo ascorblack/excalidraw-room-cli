@@ -153,6 +153,16 @@ Delete every live element:
 }
 ```
 
+Move decorative backgrounds behind content:
+
+```json
+{
+  "command": "elements.reorder",
+  "ids": ["background-id"],
+  "position": "back"
+}
+```
+
 ### Transaction
 
 Use one transaction for full redraws so deletion and creation are applied as one write:

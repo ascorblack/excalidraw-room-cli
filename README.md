@@ -291,6 +291,16 @@ Delete elements:
 }
 ```
 
+Move elements behind or above others:
+
+```json
+{
+  "command": "elements.reorder",
+  "ids": ["background-id"],
+  "position": "back"
+}
+```
+
 Delete all live elements:
 
 ```json

@@ -255,7 +255,13 @@ type ElementsDeleteCommand = {
   all?: true;
 };
 
-type ApplyJsonCommand = ElementsAddCommand | ElementsUpdateCommand | ElementsDeleteCommand;
+type ElementsReorderCommand = {
+  command: "elements.reorder";
+  ids: string[];
+  position: "back" | "front";
+};
+
+type ApplyJsonCommand = ElementsAddCommand | ElementsUpdateCommand | ElementsDeleteCommand | ElementsReorderCommand;
 
 type ApplyJsonTransaction = {
   commands: ApplyJsonCommand[];
@@ -366,6 +372,7 @@ Spec formats:
      { "command": "elements.add", "ops": [ ... ] }
      { "command": "elements.update", "updates": [ { "id": "...", "set": { ... } } ] }
      { "command": "elements.delete", "ids": [ ... ] | "all": true }
+     { "command": "elements.reorder", "ids": [ ... ], "position": "back|front" }
   2. Transaction:
      { "commands": [ { "command": "elements.delete", "all": true }, { "command": "elements.add", "ops": [ ... ] } ] }
   3. Legacy array of operations:
@@ -381,7 +388,7 @@ Supported operations:
   addArrow { x1,y1,x2,y2 | fromId,toId, strokeColor?, endArrowhead? }
   move     { id, dx?, dy?, x?, y? }
   delete   { ids: [...] }
-  commands { elements.add | elements.update | elements.delete }
+  commands { elements.add | elements.update | elements.delete | elements.reorder }
 
 Agent heredoc example:
   ${CLI_BIN_NAME} apply-json '<roomUrl>' <<'JSON'
@@ -1463,7 +1470,12 @@ async function encryptSocketPayload(roomKey: string, payload: SocketUpdate): Pro
   return { encrypted: new Uint8Array(encrypted), iv };
 }
 
-async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement[], config: RuntimeConfig): Promise<void> {
+async function broadcastUpdate(
+  room: RoomRef,
+  changedElements: ExcalidrawElement[],
+  config: RuntimeConfig,
+  fullScene?: ExcalidrawElement[],
+): Promise<void> {
   if (room.backend === "excalidash") {
     const session = await getExcalidashSession(config);
     const socket = io(config.excalidashApiUrl, {
@@ -1503,6 +1515,11 @@ async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement
       socket.emit("element-update", {
         drawingId: room.roomId,
         elements: changedElements,
+        ...(fullScene
+          ? {
+              elementOrder: getLiveElements(fullScene).map((element) => element.id),
+            }
+          : {}),
       });
       await new Promise((resolve) => setTimeout(resolve, 150));
     } finally {
@@ -1526,7 +1543,7 @@ async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement
 
 async function persistChange(room: RoomRef, change: SceneChange, config: RuntimeConfig): Promise<void> {
   await writeScene(room, change.next, config);
-  await broadcastUpdate(room, change.changed, config);
+  await broadcastUpdate(room, change.changed, config, change.next);
   console.log(change.summary);
 }
 
@@ -2222,6 +2239,29 @@ function applyElementsDeleteCommand(
   return result;
 }
 
+function applyElementsReorderCommand(elements: ExcalidrawElement[], command: ElementsReorderCommand): SceneChange {
+  if (!Array.isArray(command.ids) || command.ids.length === 0) {
+    throw new Error("elements.reorder.ids must be a non-empty array");
+  }
+  ensureUniqueStrings(command.ids, "reorder id");
+  if (command.position !== "back" && command.position !== "front") {
+    throw new Error("elements.reorder.position must be back or front");
+  }
+
+  const idSet = new Set(command.ids);
+  for (const id of idSet) {
+    getElementById(elements, id);
+  }
+
+  const moved = elements.filter((element) => idSet.has(element.id));
+  const rest = elements.filter((element) => !idSet.has(element.id));
+  return {
+    next: command.position === "back" ? [...moved, ...rest] : [...rest, ...moved],
+    changed: moved,
+    summary: `Moved ${moved.length} element(s) to ${command.position}`,
+  };
+}
+
 function applyJsonCommand(
   elements: ExcalidrawElement[],
   command: ApplyJsonCommand,
@@ -2234,6 +2274,8 @@ function applyJsonCommand(
       return applyElementUpdates(elements, command.updates);
     case "elements.delete":
       return applyElementsDeleteCommand(elements, command, deletedInTransaction);
+    case "elements.reorder":
+      return applyElementsReorderCommand(elements, command);
     default:
       throw new Error(`Unsupported command: ${(command as { command?: unknown }).command}`);
   }
@@ -2528,7 +2570,7 @@ async function commandSendFile(args: string[]): Promise<void> {
     return;
   }
   await writeScene(room, [...current, ...incoming], config);
-  await broadcastUpdate(room, incoming, config);
+  await broadcastUpdate(room, incoming, config, [...current, ...incoming]);
   console.log(`Sent ${incoming.length} elements with mode=append`);
 }
 
@@ -2596,7 +2638,7 @@ async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: Runti
   }
 
   await writeScene(room, scene, config);
-  await broadcastUpdate(room, changed.length > 0 ? changed : scene, config);
+  await broadcastUpdate(room, changed.length > 0 ? changed : scene, config, scene);
   console.log(summaries.join("; "));
 }
 
