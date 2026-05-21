@@ -193,6 +193,7 @@ type AddRectSpec = {
   labelFontFamily?: number;
   labelPosition?: LabelPosition;
   labelPadding?: number;
+  labelGap?: number;
   layer?: ElementLayer;
   bindLabel?: boolean;
   groupLabel?: boolean;
@@ -1855,7 +1856,13 @@ function boundsToCropArea(bounds: ElementBounds, padding: number): CropArea {
   };
 }
 
-function resolveRectGeometry(elements: ExcalidrawElement[], spec: AddRectSpec): { x: number; y: number; width: number; height: number } {
+function resolveRectGeometry(
+  elements: ExcalidrawElement[],
+  spec: AddRectSpec,
+  labelPosition: LabelPosition,
+  labelFontSize: number,
+  labelGap: number,
+): { x: number; y: number; width: number; height: number } {
   if (Array.isArray(spec.fitToIds)) {
     if (spec.fitToIds.length === 0) {
       throw new Error("addRect.fitToIds must be a non-empty array");
@@ -1867,11 +1874,15 @@ function resolveRectGeometry(elements: ExcalidrawElement[], spec: AddRectSpec): 
     if (!Number.isFinite(padding) || padding < 0) {
       throw new Error("addRect.padding must be a non-negative number");
     }
+    const labelHeight = spec.label && (labelPosition === "topLeft" || labelPosition === "topCenter")
+      ? estimateTextHeight(spec.label, labelFontSize)
+      : 0;
+    const topPadding = padding + (labelHeight > 0 ? labelHeight + labelGap : 0);
     return {
       x: bounds.minX - padding,
-      y: bounds.minY - padding,
+      y: bounds.minY - topPadding,
       width: bounds.maxX - bounds.minX + padding * 2,
-      height: bounds.maxY - bounds.minY + padding * 2,
+      height: bounds.maxY - bounds.minY + topPadding + padding,
     };
   }
 
@@ -2084,7 +2095,16 @@ function resolveLabelPlacement(
 }
 
 function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneChange {
-  const geometry = resolveRectGeometry(elements, spec);
+  const labelFontSize = spec.labelFontSize ?? 22;
+  const labelPosition = spec.labelPosition ?? "center";
+  if (!["center", "topLeft", "topCenter", "leftCenter"].includes(labelPosition)) {
+    throw new Error("addRect.labelPosition must be center, topLeft, topCenter, or leftCenter");
+  }
+  const labelGap = spec.labelGap ?? 8;
+  if (!Number.isFinite(labelGap) || labelGap < 0) {
+    throw new Error("addRect.labelGap must be a non-negative number");
+  }
+  const geometry = resolveRectGeometry(elements, spec, labelPosition, labelFontSize, labelGap);
   const groupIds = spec.label && spec.groupLabel !== false ? [randomId()] : [];
   const layer = spec.layer ?? "front";
   if (layer !== "front" && layer !== "back") {
@@ -2108,12 +2128,7 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
     };
   }
 
-  const labelFontSize = spec.labelFontSize ?? 22;
   const bindLabel = spec.bindLabel !== false;
-  const labelPosition = spec.labelPosition ?? "center";
-  if (!["center", "topLeft", "topCenter", "leftCenter"].includes(labelPosition)) {
-    throw new Error("addRect.labelPosition must be center, topLeft, topCenter, or leftCenter");
-  }
   const labelPadding = spec.labelPadding ?? 12;
   if (!Number.isFinite(labelPadding) || labelPadding < 0) {
     throw new Error("addRect.labelPadding must be a non-negative number");

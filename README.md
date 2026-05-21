@@ -422,6 +422,7 @@ Raw elements must be complete Excalidraw elements. `elements.add` fails when an 
   "labelFontSize": 24,
   "labelColor": "#1e1e1e",
   "labelPosition": "center",
+  "labelGap": 8,
   "bindLabel": true,
   "groupLabel": true,
   "layer": "front"
@@ -441,11 +442,12 @@ To create a background or section frame around existing elements, use `fitToIds`
   "strokeColor": "#6366f1",
   "label": "Основной поток",
   "labelPosition": "topLeft",
+  "labelGap": 8,
   "layer": "back"
 }
 ```
 
-`labelPosition` accepts `center`, `topLeft`, `topCenter`, or `leftCenter`.
+`labelPosition` accepts `center`, `topLeft`, `topCenter`, or `leftCenter`. For `topLeft` and `topCenter` with `fitToIds`, the CLI reserves extra top space for the label so it does not overlap the framed content; `labelGap` controls the extra gap below the label.
 
 ### `addText`
 
