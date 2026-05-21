@@ -4,6 +4,8 @@
 
 It is useful when you want a script or an AI agent to make precise changes to a live Excalidraw room without clicking around in the browser UI.
 
+This fork includes self-hosted Excalidraw, ExcaliDash, fitted backgrounds, bindings, images, embeddables, and native frame support beyond the upstream project. See [FORK_CHANGES.md](FORK_CHANGES.md) for the full fork comparison.
+
 ## Requirements
 
 - Bun 1.1+
