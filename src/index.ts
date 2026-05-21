@@ -101,6 +101,23 @@ type ExcalidrawArrowElement = ExcalidrawElement & {
   elbowed: boolean;
 };
 
+type BinaryFileData = {
+  mimeType: string;
+  id: string;
+  dataURL: string;
+  created: number;
+  lastRetrieved?: number;
+  version?: number;
+};
+
+type BinaryFiles = Record<string, BinaryFileData>;
+
+type SceneData = {
+  elements: ExcalidrawElement[];
+  appState: Record<string, unknown>;
+  files: BinaryFiles;
+};
+
 type SocketUpdate =
   | { type: "SCENE_INIT"; payload: { elements: ExcalidrawElement[] } }
   | { type: "SCENE_UPDATE"; payload: { elements: ExcalidrawElement[] } }
@@ -111,6 +128,8 @@ type SceneChange = {
   next: ExcalidrawElement[];
   changed: ExcalidrawElement[];
   summary: string;
+  appState?: Record<string, unknown>;
+  files?: BinaryFiles;
 };
 
 type AnchorPoint = {
@@ -179,6 +198,7 @@ type RuntimeConfig = {
 
 type AddRectSpec = {
   type: "addRect";
+  id?: string;
   x?: number;
   y?: number;
   width?: number;
@@ -201,6 +221,7 @@ type AddRectSpec = {
 
 type AddTextSpec = {
   type: "addText";
+  id?: string;
   x: number;
   y: number;
   text: string;
@@ -210,8 +231,50 @@ type AddTextSpec = {
   textAlign?: "left" | "center" | "right";
 };
 
+type AddImageSpec = {
+  type: "addImage";
+  id?: string;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  path?: string;
+  dataURL?: string;
+  mimeType?: string;
+  fileId?: string;
+  strokeColor?: string;
+  backgroundColor?: string;
+};
+
+type AddEmbeddableSpec = {
+  type: "addEmbeddable";
+  id?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  link: string;
+  strokeColor?: string;
+  backgroundColor?: string;
+};
+
+type AddFrameSpec = {
+  type: "addFrame";
+  id?: string;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  fitToIds?: string[];
+  padding?: number;
+  name?: string;
+  strokeColor?: string;
+  backgroundColor?: string;
+};
+
 type AddArrowSpec = {
   type: "addArrow";
+  id?: string;
   x1?: number;
   y1?: number;
   x2?: number;
@@ -246,11 +309,14 @@ type MoveSpec = {
 type AgentSpec =
   | AddRectSpec
   | AddTextSpec
+  | AddImageSpec
+  | AddEmbeddableSpec
+  | AddFrameSpec
   | AddArrowSpec
   | DeleteSpec
   | MoveSpec;
 
-type AddOnlySpec = AddRectSpec | AddTextSpec | AddArrowSpec;
+type AddOnlySpec = AddRectSpec | AddTextSpec | AddImageSpec | AddEmbeddableSpec | AddFrameSpec | AddArrowSpec;
 
 type ElementUpdateSpec = {
   id: string;
@@ -404,6 +470,9 @@ Spec formats:
 Supported operations:
   addRect  { x,y,width,height | fitToIds,padding?, backgroundColor?, strokeColor?, label?, labelPosition?, layer?, bindLabel?, groupLabel? }
   addText  { x, y, text, fontSize?, fontFamily?, strokeColor?, textAlign? }
+  addImage { x, y, width?, height?, path? | dataURL?, mimeType?, fileId? }
+  addEmbeddable { x, y, width, height, link }
+  addFrame { x,y,width,height | fitToIds,padding?, name? }
   addArrow { x1,y1,x2,y2 | fromId,toId, fromSide?, toSide?, fromOffset?, toOffset?, startGap?, endGap?, strokeColor?, endArrowhead? }
   move     { id, dx?, dy?, x?, y?, includeGroup? }
   delete   { ids: [...] }
@@ -1164,9 +1233,17 @@ async function decryptBytes(roomKey: string, iv: Uint8Array, ciphertext: Uint8Ar
 }
 
 async function readScene(room: RoomRef, config?: RuntimeConfig): Promise<ExcalidrawElement[]> {
+  return (await readSceneData(room, config)).elements;
+}
+
+async function readSceneData(room: RoomRef, config?: RuntimeConfig): Promise<SceneData> {
   if (room.backend === "excalidash") {
     const drawing = await readExcalidashDrawing(room, requireRuntimeConfig(config, "excalidash"));
-    return drawing.elements ?? [];
+    return {
+      elements: drawing.elements ?? [],
+      appState: drawing.appState ?? {},
+      files: (drawing.files ?? {}) as BinaryFiles,
+    };
   }
 
   const url =
@@ -1180,10 +1257,10 @@ async function readScene(room: RoomRef, config?: RuntimeConfig): Promise<Excalid
   const ciphertext = doc.fields?.ciphertext?.bytesValue;
   const iv = doc.fields?.iv?.bytesValue;
   if (!ciphertext || !iv) {
-    return [];
+    return { elements: [], appState: {}, files: {} };
   }
   const json = await decryptBytes(room.roomKey, bytesFromBase64(iv), bytesFromBase64(ciphertext));
-  return JSON.parse(json) as ExcalidrawElement[];
+  return { elements: JSON.parse(json) as ExcalidrawElement[], appState: {}, files: {} };
 }
 
 function getSceneVersion(elements: ExcalidrawElement[]): number {
@@ -1195,8 +1272,27 @@ async function writeScene(room: RoomRef, elements: ExcalidrawElement[], config?:
     await writeExcalidashDrawing(room, elements, requireRuntimeConfig(config, "excalidash"));
     return;
   }
+  await writeSceneData(room, { elements, appState: {}, files: {} }, config);
+}
 
-  const { ciphertext, iv } = await encryptJson(room.roomKey, elements);
+async function writeSceneData(room: RoomRef, scene: SceneData, config?: RuntimeConfig): Promise<void> {
+  if (room.backend === "excalidash") {
+    const runtimeConfig = requireRuntimeConfig(config, "excalidash");
+    const previous = excalidashDrawingCache.get(room.roomId) ?? (await readExcalidashDrawing(room, runtimeConfig));
+    const updated = await excalidashFetch<ExcalidashDrawing>(runtimeConfig, `/drawings/${encodeURIComponent(room.roomId)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        elements: scene.elements,
+        appState: scene.appState ?? previous.appState ?? {},
+        files: scene.files ?? (previous.files as BinaryFiles | undefined) ?? {},
+        ...(typeof previous.version === "number" ? { version: previous.version } : {}),
+      }),
+    });
+    excalidashDrawingCache.set(room.roomId, updated);
+    return;
+  }
+
+  const { ciphertext, iv } = await encryptJson(room.roomKey, scene.elements);
   const url =
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}` +
     `/databases/(default)/documents/scenes/${room.roomId}?key=${FIREBASE_API_KEY}`;
@@ -1207,7 +1303,7 @@ async function writeScene(room: RoomRef, elements: ExcalidrawElement[], config?:
     },
     body: JSON.stringify({
       fields: {
-        sceneVersion: { integerValue: String(getSceneVersion(elements)) },
+        sceneVersion: { integerValue: String(getSceneVersion(scene.elements)) },
         ciphertext: { bytesValue: bytesToBase64(ciphertext) },
         iv: { bytesValue: bytesToBase64(iv) },
       },
@@ -1258,7 +1354,111 @@ function estimateTextHeight(text: string, fontSize: number, lineHeight = DEFAULT
   return Math.round(lines * fontSize * lineHeight);
 }
 
+function dataUrlMimeType(dataURL: string): string | null {
+  const match = /^data:([^;,]+)[;,]/i.exec(dataURL);
+  return match?.[1] ?? null;
+}
+
+function extensionMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".svg":
+      return "image/svg+xml";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function readImageDimensions(bytes: Uint8Array, mimeType: string): { width: number; height: number } | null {
+  if (mimeType === "image/png" && bytes.length >= 24) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (
+      view.getUint32(0) === 0x89504e47 &&
+      view.getUint32(4) === 0x0d0a1a0a
+    ) {
+      return { width: view.getUint32(16), height: view.getUint32(20) };
+    }
+  }
+  if (mimeType === "image/jpeg" && bytes.length >= 4) {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      const length = (bytes[offset + 2] << 8) + bytes[offset + 3];
+      if (length < 2) {
+        return null;
+      }
+      if (marker >= 0xc0 && marker <= 0xc3) {
+        return {
+          height: (bytes[offset + 5] << 8) + bytes[offset + 6],
+          width: (bytes[offset + 7] << 8) + bytes[offset + 8],
+        };
+      }
+      offset += 2 + length;
+    }
+  }
+  if (mimeType === "image/gif" && bytes.length >= 10) {
+    const signature = decoder.decode(bytes.slice(0, 6));
+    if (signature === "GIF87a" || signature === "GIF89a") {
+      return {
+        width: bytes[6] + bytes[7] * 256,
+        height: bytes[8] + bytes[9] * 256,
+      };
+    }
+  }
+  return null;
+}
+
+async function binaryFileFromImageSpec(spec: AddImageSpec): Promise<{ file: BinaryFileData; dimensions: { width: number; height: number } | null }> {
+  if (spec.path && spec.dataURL) {
+    throw new Error("addImage accepts either path or dataURL, not both");
+  }
+  if (!spec.path && !spec.dataURL) {
+    throw new Error("addImage requires path or dataURL");
+  }
+
+  const fileId = spec.fileId ?? randomId();
+  if (spec.dataURL) {
+    const mimeType = spec.mimeType ?? dataUrlMimeType(spec.dataURL) ?? "application/octet-stream";
+    return {
+      file: {
+        id: fileId,
+        mimeType,
+        dataURL: spec.dataURL,
+        created: now(),
+      },
+      dimensions: null,
+    };
+  }
+
+  const filePath = path.resolve(spec.path ?? "");
+  const bytes = new Uint8Array(await fs.readFile(filePath));
+  const mimeType = spec.mimeType ?? extensionMimeType(filePath);
+  return {
+    file: {
+      id: fileId,
+      mimeType,
+      dataURL: `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`,
+      created: now(),
+    },
+    dimensions: readImageDimensions(bytes, mimeType),
+  };
+}
+
 function createBaseElement(args: {
+  id?: string;
   type: string;
   x: number;
   y: number;
@@ -1277,7 +1477,7 @@ function createBaseElement(args: {
   index: string;
 }): ExcalidrawElement {
   return {
-    id: randomId(),
+    id: args.id ?? randomId(),
     type: args.type,
     x: args.x,
     y: args.y,
@@ -1307,6 +1507,7 @@ function createBaseElement(args: {
 }
 
 function createRectangle(args: {
+  id?: string;
   x: number;
   y: number;
   width: number;
@@ -1319,6 +1520,7 @@ function createRectangle(args: {
 }): ExcalidrawElement {
   return createBaseElement({
     type: "rectangle",
+    id: args.id,
     x: args.x,
     y: args.y,
     width: args.width,
@@ -1332,7 +1534,126 @@ function createRectangle(args: {
   });
 }
 
+function createGenericShape(args: {
+  id?: string;
+  type: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  backgroundColor?: string;
+  strokeColor?: string;
+  groupIds?: string[];
+  boundElements?: BoundElementRef[] | null;
+  index: string;
+}): ExcalidrawElement {
+  return createBaseElement({
+    type: args.type,
+    id: args.id,
+    x: args.x,
+    y: args.y,
+    width: args.width,
+    height: args.height,
+    backgroundColor: args.backgroundColor ?? "transparent",
+    strokeColor: args.strokeColor ?? "#1e1e1e",
+    roundness: { type: 3 },
+    groupIds: args.groupIds,
+    boundElements: args.boundElements,
+    index: args.index,
+  });
+}
+
+function createFrame(args: {
+  id?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  name?: string;
+  backgroundColor?: string;
+  strokeColor?: string;
+  index: string;
+}): ExcalidrawElement {
+  return {
+    ...createBaseElement({
+      type: "frame",
+      id: args.id,
+      x: args.x,
+      y: args.y,
+      width: args.width,
+      height: args.height,
+      backgroundColor: args.backgroundColor ?? "transparent",
+      strokeColor: args.strokeColor ?? "#bbb",
+      roundness: { type: 3 },
+      index: args.index,
+    }),
+    name: args.name ?? null,
+  };
+}
+
+function createImage(args: {
+  id?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fileId: string;
+  backgroundColor?: string;
+  strokeColor?: string;
+  index: string;
+}): ExcalidrawElement {
+  return {
+    ...createBaseElement({
+      type: "image",
+      id: args.id,
+      x: args.x,
+      y: args.y,
+      width: args.width,
+      height: args.height,
+      backgroundColor: args.backgroundColor ?? "transparent",
+      strokeColor: args.strokeColor ?? "transparent",
+      strokeWidth: 0,
+      roughness: 0,
+      roundness: null,
+      index: args.index,
+    }),
+    fileId: args.fileId,
+    status: "saved",
+    scale: [1, 1],
+    crop: null,
+  };
+}
+
+function createEmbeddable(args: {
+  id?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  link: string;
+  backgroundColor?: string;
+  strokeColor?: string;
+  index: string;
+}): ExcalidrawElement {
+  return {
+    ...createBaseElement({
+      type: "embeddable",
+      id: args.id,
+      x: args.x,
+      y: args.y,
+      width: args.width,
+      height: args.height,
+      backgroundColor: args.backgroundColor ?? "transparent",
+      strokeColor: args.strokeColor ?? "#1e1e1e",
+      roundness: { type: 3 },
+      index: args.index,
+    }),
+    link: args.link,
+  };
+}
+
 function createText(args: {
+  id?: string;
   x: number;
   y: number;
   text: string;
@@ -1356,6 +1677,7 @@ function createText(args: {
   return {
     ...createBaseElement({
       type: "text",
+      id: args.id,
       x: Math.round(args.x - offsetX),
       y: args.y,
       width,
@@ -1386,6 +1708,16 @@ function getElementById(elements: ExcalidrawElement[], id: string): ExcalidrawEl
     throw new Error(`Element not found: ${id}`);
   }
   return element;
+}
+
+function ensureNewElementId(elements: ExcalidrawElement[], id: string | undefined, context: string): void {
+  if (!id) {
+    return;
+  }
+  requireStringValue(id, `${context}.id`);
+  if (elements.some((element) => element.id === id && !element.isDeleted)) {
+    throw new Error(`${context}.id already exists live: ${id}`);
+  }
 }
 
 function getElementCenter(element: ExcalidrawElement): { x: number; y: number } {
@@ -1463,6 +1795,7 @@ function getAnchorForElement(
 }
 
 function createArrow(args: {
+  id?: string;
   start: AnchorPoint;
   end: AnchorPoint;
   strokeColor?: string;
@@ -1474,6 +1807,7 @@ function createArrow(args: {
   return {
     ...createBaseElement({
       type: "arrow",
+      id: args.id,
       x,
       y,
       width: args.end.x - args.start.x,
@@ -1635,7 +1969,16 @@ async function broadcastUpdate(
 }
 
 async function persistChange(room: RoomRef, change: SceneChange, config: RuntimeConfig): Promise<void> {
-  await writeScene(room, change.next, config);
+  if (change.files || change.appState) {
+    const current = await readSceneData(room, config);
+    await writeSceneData(room, {
+      elements: change.next,
+      appState: change.appState ?? current.appState,
+      files: { ...current.files, ...(change.files ?? {}) },
+    }, config);
+  } else {
+    await writeScene(room, change.next, config);
+  }
   await broadcastUpdate(room, change.changed, config, change.next);
   console.log(change.summary);
 }
@@ -1692,6 +2035,21 @@ function normalizeElementsFile(value: unknown): ExcalidrawElement[] {
   }
   if (value && typeof value === "object" && Array.isArray((value as { elements?: unknown }).elements)) {
     return (value as { elements: ExcalidrawElement[] }).elements;
+  }
+  throw new Error("Expected an elements array or an object with elements");
+}
+
+function normalizeSceneFile(value: unknown): SceneData {
+  if (Array.isArray(value)) {
+    return { elements: value as ExcalidrawElement[], appState: {}, files: {} };
+  }
+  if (value && typeof value === "object" && Array.isArray((value as { elements?: unknown }).elements)) {
+    const scene = value as { elements: ExcalidrawElement[]; appState?: Record<string, unknown>; files?: BinaryFiles };
+    return {
+      elements: scene.elements,
+      appState: scene.appState ?? {},
+      files: scene.files ?? {},
+    };
   }
   throw new Error("Expected an elements array or an object with elements");
 }
@@ -1858,7 +2216,7 @@ function boundsToCropArea(bounds: ElementBounds, padding: number): CropArea {
 
 function resolveRectGeometry(
   elements: ExcalidrawElement[],
-  spec: AddRectSpec,
+  spec: AddRectSpec | AddFrameSpec,
   labelPosition: LabelPosition,
   labelFontSize: number,
   labelGap: number,
@@ -1874,8 +2232,9 @@ function resolveRectGeometry(
     if (!Number.isFinite(padding) || padding < 0) {
       throw new Error("addRect.padding must be a non-negative number");
     }
-    const labelHeight = spec.label && (labelPosition === "topLeft" || labelPosition === "topCenter")
-      ? estimateTextHeight(spec.label, labelFontSize)
+    const label = "label" in spec ? spec.label : undefined;
+    const labelHeight = label && (labelPosition === "topLeft" || labelPosition === "topCenter")
+      ? estimateTextHeight(label, labelFontSize)
       : 0;
     const topPadding = padding + (labelHeight > 0 ? labelHeight + labelGap : 0);
     return {
@@ -1895,6 +2254,10 @@ function resolveRectGeometry(
     width: spec.width,
     height: spec.height,
   };
+}
+
+function resolveFixedGeometry(elements: ExcalidrawElement[], spec: AddFrameSpec): { x: number; y: number; width: number; height: number } {
+  return resolveRectGeometry(elements, spec, "center", 0, 0);
 }
 
 async function pathExists(targetPath: string): Promise<boolean> {
@@ -2021,6 +2384,7 @@ function parseCropArea(args: string[], elements: ExcalidrawElement[]): CropArea 
 
 async function exportSceneImage(
   elements: ExcalidrawElement[],
+  files: BinaryFiles,
   outPath: string,
   format: "png" | "svg",
   cropArea: CropArea | null,
@@ -2030,7 +2394,7 @@ async function exportSceneImage(
   const tmpScenePath = `/tmp/excalidraw-room-cli-scene-${Date.now()}.json`;
   const outDir = path.dirname(outPath);
   await Bun.$`mkdir -p ${outDir}`.quiet();
-  await Bun.write(tmpScenePath, JSON.stringify({ elements: getLiveElements(elements), cropArea }));
+  await Bun.write(tmpScenePath, JSON.stringify({ elements: getLiveElements(elements), files, cropArea }));
   await Bun.$`node ${path.join(PACKAGE_ROOT, "scripts/export-runner.mjs")} ${tmpScenePath} ${path.resolve(bundlePath)} ${outPath} ${format} ${chromeBin}`.quiet();
 }
 
@@ -2095,6 +2459,7 @@ function resolveLabelPlacement(
 }
 
 function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneChange {
+  ensureNewElementId(elements, spec.id, "addRect");
   const labelFontSize = spec.labelFontSize ?? 22;
   const labelPosition = spec.labelPosition ?? "center";
   if (!["center", "topLeft", "topCenter", "leftCenter"].includes(labelPosition)) {
@@ -2111,6 +2476,7 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
     throw new Error("addRect.layer must be front or back");
   }
   const rect = createRectangle({
+    id: spec.id,
     x: geometry.x,
     y: geometry.y,
     width: geometry.width,
@@ -2168,7 +2534,9 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
 }
 
 function applyAddText(elements: ExcalidrawElement[], spec: AddTextSpec): SceneChange {
+  ensureNewElementId(elements, spec.id, "addText");
   const text = createText({
+    id: spec.id,
     x: spec.x,
     y: spec.y,
     text: spec.text,
@@ -2182,6 +2550,81 @@ function applyAddText(elements: ExcalidrawElement[], spec: AddTextSpec): SceneCh
     next: [...elements, text],
     changed: [text],
     summary: `Added text ${text.id}`,
+  };
+}
+
+async function applyAddImage(elements: ExcalidrawElement[], spec: AddImageSpec): Promise<SceneChange> {
+  ensureNewElementId(elements, spec.id, "addImage");
+  const { file, dimensions } = await binaryFileFromImageSpec(spec);
+  const width = spec.width ?? dimensions?.width ?? 320;
+  const height = spec.height ?? dimensions?.height ?? 240;
+  const image = createImage({
+    id: spec.id,
+    x: spec.x,
+    y: spec.y,
+    width,
+    height,
+    fileId: file.id,
+    backgroundColor: spec.backgroundColor,
+    strokeColor: spec.strokeColor,
+    index: nextIndex(elements),
+  });
+  return {
+    next: [...elements, image],
+    changed: [image],
+    files: { [file.id]: file },
+    summary: `Added image ${image.id}`,
+  };
+}
+
+function applyAddEmbeddable(elements: ExcalidrawElement[], spec: AddEmbeddableSpec): SceneChange {
+  ensureNewElementId(elements, spec.id, "addEmbeddable");
+  try {
+    new URL(spec.link);
+  } catch {
+    throw new Error("addEmbeddable.link must be an absolute URL");
+  }
+  const embeddable = createEmbeddable({
+    id: spec.id,
+    x: spec.x,
+    y: spec.y,
+    width: spec.width,
+    height: spec.height,
+    link: spec.link,
+    backgroundColor: spec.backgroundColor,
+    strokeColor: spec.strokeColor,
+    index: nextIndex(elements),
+  });
+  return {
+    next: [...elements, embeddable],
+    changed: [embeddable],
+    summary: `Added embeddable ${embeddable.id}`,
+  };
+}
+
+function applyAddFrame(elements: ExcalidrawElement[], spec: AddFrameSpec): SceneChange {
+  ensureNewElementId(elements, spec.id, "addFrame");
+  const geometry = resolveFixedGeometry(elements, spec);
+  const frame = createFrame({
+    id: spec.id,
+    x: geometry.x,
+    y: geometry.y,
+    width: geometry.width,
+    height: geometry.height,
+    name: spec.name,
+    backgroundColor: spec.backgroundColor,
+    strokeColor: spec.strokeColor,
+    index: firstIndex(elements),
+  });
+  const framedIds = new Set(spec.fitToIds ?? []);
+  const next = [frame, ...elements.map((element) => (
+    framedIds.has(element.id) ? touchElement(element, { frameId: frame.id }) : element
+  ))];
+  const changed = [frame, ...next.filter((element) => framedIds.has(element.id))];
+  return {
+    next,
+    changed,
+    summary: `Added frame ${frame.id}`,
   };
 }
 
@@ -2211,9 +2654,11 @@ function resolveArrowEndpoint(
 }
 
 function applyAddArrow(elements: ExcalidrawElement[], spec: AddArrowSpec): SceneChange {
+  ensureNewElementId(elements, spec.id, "addArrow");
   const start = resolveArrowEndpoint(elements, "start", spec);
   const end = resolveArrowEndpoint(elements, "end", spec);
   const arrow = createArrow({
+    id: spec.id,
     start,
     end,
     strokeColor: spec.strokeColor,
@@ -2291,12 +2736,18 @@ function applyMove(elements: ExcalidrawElement[], spec: MoveSpec): SceneChange {
   };
 }
 
-function applyAgentOp(elements: ExcalidrawElement[], spec: AgentSpec): SceneChange {
+async function applyAgentOp(elements: ExcalidrawElement[], spec: AgentSpec): Promise<SceneChange> {
   switch (spec.type) {
     case "addRect":
       return applyAddRect(elements, spec);
     case "addText":
       return applyAddText(elements, spec);
+    case "addImage":
+      return applyAddImage(elements, spec);
+    case "addEmbeddable":
+      return applyAddEmbeddable(elements, spec);
+    case "addFrame":
+      return applyAddFrame(elements, spec);
     case "addArrow":
       return applyAddArrow(elements, spec);
     case "delete":
@@ -2308,12 +2759,18 @@ function applyAgentOp(elements: ExcalidrawElement[], spec: AgentSpec): SceneChan
   }
 }
 
-function applyAddOnlyOp(elements: ExcalidrawElement[], spec: AddOnlySpec): SceneChange {
+async function applyAddOnlyOp(elements: ExcalidrawElement[], spec: AddOnlySpec): Promise<SceneChange> {
   switch (spec.type) {
     case "addRect":
       return applyAddRect(elements, spec);
     case "addText":
       return applyAddText(elements, spec);
+    case "addImage":
+      return applyAddImage(elements, spec);
+    case "addEmbeddable":
+      return applyAddEmbeddable(elements, spec);
+    case "addFrame":
+      return applyAddFrame(elements, spec);
     case "addArrow":
       return applyAddArrow(elements, spec);
     default:
@@ -2417,11 +2874,11 @@ function applyElementUpdates(elements: ExcalidrawElement[], updates: ElementUpda
   };
 }
 
-function applyElementsAddCommand(
+async function applyElementsAddCommand(
   elements: ExcalidrawElement[],
   command: ElementsAddCommand,
   deletedInTransaction: Set<string>,
-): SceneChange {
+): Promise<SceneChange> {
   const hasOps = Array.isArray(command.ops);
   const hasElements = Array.isArray(command.elements);
   if (hasOps === hasElements) {
@@ -2431,16 +2888,19 @@ function applyElementsAddCommand(
   if (hasOps) {
     let scene = elements;
     const changed: ExcalidrawElement[] = [];
+    let files: BinaryFiles = {};
     const summaries: string[] = [];
     for (const op of command.ops ?? []) {
-      const result = applyAddOnlyOp(scene, op);
+      const result = await applyAddOnlyOp(scene, op);
       scene = result.next;
       changed.push(...result.changed);
+      files = { ...files, ...(result.files ?? {}) };
       summaries.push(result.summary);
     }
     return {
       next: scene,
       changed,
+      files,
       summary: summaries.length > 0 ? summaries.join("; ") : "Added 0 element(s)",
     };
   }
@@ -2518,11 +2978,11 @@ function applyElementsReorderCommand(elements: ExcalidrawElement[], command: Ele
   };
 }
 
-function applyJsonCommand(
+async function applyJsonCommand(
   elements: ExcalidrawElement[],
   command: ApplyJsonCommand,
   deletedInTransaction: Set<string>,
-): SceneChange {
+): Promise<SceneChange> {
   switch (command.command) {
     case "elements.add":
       return applyElementsAddCommand(elements, command, deletedInTransaction);
@@ -2650,11 +3110,11 @@ async function commandDump(args: string[]): Promise<void> {
   const room = parseRoomUrl(values[0] ?? usage());
   const config = await resolveRuntimeConfig(args, room.appUrl);
   const outPath = values[1];
-  const elements = await readScene(room, config);
-  const json = JSON.stringify({ elements }, null, 2);
+  const scene = await readSceneData(room, config);
+  const json = JSON.stringify(scene, null, 2);
   if (outPath) {
     await Bun.write(outPath, json);
-    console.log(`Saved ${elements.length} elements to ${outPath}`);
+    console.log(`Saved ${scene.elements.length} elements to ${outPath}`);
     return;
   }
   console.log(json);
@@ -2722,9 +3182,9 @@ async function commandSnapshot(args: string[]): Promise<void> {
   const room = parseRoomUrl(values[0] ?? usage());
   const config = await resolveRuntimeConfig(args, room.appUrl);
   const outPath = values[1] ?? snapshotDefaultPath(room);
-  const elements = await readScene(room, config);
+  const scene = await readSceneData(room, config);
   await Bun.$`mkdir -p ${path.dirname(outPath)}`.quiet();
-  await Bun.write(outPath, JSON.stringify({ roomId: room.roomId, elements }, null, 2));
+  await Bun.write(outPath, JSON.stringify({ roomId: room.roomId, ...scene }, null, 2));
   console.log(`Saved snapshot to ${outPath}`);
 }
 
@@ -2737,10 +3197,10 @@ async function commandRestore(args: string[]): Promise<void> {
     usage();
   }
   const input = JSON.parse(await Bun.file(filePath).text());
-  const elements = normalizeElementsFile(input);
+  const scene = normalizeSceneFile(input);
   const current = await readScene(room, config);
-  const change = buildReplaceScene(current, elements);
-  await persistChange(room, { ...change, summary: `Restored ${elements.length} elements from ${filePath}` }, config);
+  const change = buildReplaceScene(current, scene.elements);
+  await persistChange(room, { ...change, files: scene.files, appState: scene.appState, summary: `Restored ${scene.elements.length} elements from ${filePath}` }, config);
 }
 
 async function commandVersion(): Promise<void> {
@@ -2819,20 +3279,29 @@ async function commandSendFile(args: string[]): Promise<void> {
   }
   const mode = parseMode(args);
   const input = JSON.parse(await Bun.file(filePath).text());
-  const incoming = normalizeElementsFile(input);
-  const current = await readScene(room, config);
+  const incoming = normalizeSceneFile(input);
+  const current = await readSceneData(room, config);
   if (mode === "replace") {
-    await persistChange(room, { ...buildReplaceScene(current, incoming), summary: `Sent ${incoming.length} elements with mode=replace` }, config);
+    await persistChange(room, {
+      ...buildReplaceScene(current.elements, incoming.elements),
+      appState: incoming.appState,
+      files: incoming.files,
+      summary: `Sent ${incoming.elements.length} elements with mode=replace`,
+    }, config);
     return;
   }
-  await writeScene(room, [...current, ...incoming], config);
-  await broadcastUpdate(room, incoming, config, [...current, ...incoming]);
-  console.log(`Sent ${incoming.length} elements with mode=append`);
+  const nextElements = [...current.elements, ...incoming.elements];
+  const nextFiles = { ...current.files, ...incoming.files };
+  await writeSceneData(room, { elements: nextElements, appState: current.appState, files: nextFiles }, config);
+  await broadcastUpdate(room, incoming.elements, config, nextElements);
+  console.log(`Sent ${incoming.elements.length} elements with mode=append`);
 }
 
 async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: RuntimeConfig): Promise<void> {
-  const current = await readScene(room, config);
-  let scene = current;
+  const current = await readSceneData(room, config);
+  let elements = current.elements;
+  let files: BinaryFiles = { ...current.files };
+  let appState = current.appState;
   let changed: ExcalidrawElement[] = [];
   const summaries: string[] = [];
 
@@ -2842,46 +3311,60 @@ async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: Runti
     }
     const deletedInTransaction = new Set<string>();
     for (const command of input.commands) {
-      const result = applyJsonCommand(scene, command, deletedInTransaction);
-      scene = result.next;
+      const result = await applyJsonCommand(elements, command, deletedInTransaction);
+      elements = result.next;
       changed.push(...result.changed);
+      files = { ...files, ...(result.files ?? {}) };
+      appState = result.appState ?? appState;
       summaries.push(result.summary);
     }
   } else if (isApplyJsonCommand(input)) {
-    const result = applyJsonCommand(scene, input, new Set<string>());
-    scene = result.next;
+    const result = await applyJsonCommand(elements, input, new Set<string>());
+    elements = result.next;
     changed.push(...result.changed);
+    files = { ...files, ...(result.files ?? {}) };
+    appState = result.appState ?? appState;
     summaries.push(result.summary);
   } else if (Array.isArray(input)) {
     for (const op of input) {
-      const result = applyAgentOp(scene, op);
-      scene = result.next;
+      const result = await applyAgentOp(elements, op);
+      elements = result.next;
       changed.push(...result.changed);
+      files = { ...files, ...(result.files ?? {}) };
+      appState = result.appState ?? appState;
       summaries.push(result.summary);
     }
   } else if (Array.isArray(input.elements)) {
     const mode = input.mode ?? "append";
+    const incomingFiles = (input as { files?: BinaryFiles }).files ?? {};
+    const incomingAppState = (input as { appState?: Record<string, unknown> }).appState;
     if (mode === "replace") {
-      const result = buildReplaceScene(scene, input.elements);
-      scene = result.next;
+      const result = buildReplaceScene(elements, input.elements);
+      elements = result.next;
       changed = result.changed;
+      files = incomingFiles;
+      appState = incomingAppState ?? appState;
       summaries.push(result.summary);
     } else {
-      scene = [...scene, ...input.elements];
+      elements = [...elements, ...input.elements];
       changed = input.elements;
+      files = { ...files, ...incomingFiles };
+      appState = incomingAppState ?? appState;
       summaries.push(`Applied raw elements mode=${mode}`);
     }
   } else if (Array.isArray(input.ops)) {
     if (input.mode === "replace") {
-      const cleared = buildReplaceScene(scene, []);
-      scene = cleared.next;
+      const cleared = buildReplaceScene(elements, []);
+      elements = cleared.next;
       changed.push(...cleared.changed);
       summaries.push("Cleared current scene");
     }
     for (const op of input.ops) {
-      const result = applyAgentOp(scene, op);
-      scene = result.next;
+      const result = await applyAgentOp(elements, op);
+      elements = result.next;
       changed.push(...result.changed);
+      files = { ...files, ...(result.files ?? {}) };
+      appState = result.appState ?? appState;
       summaries.push(result.summary);
     }
   } else {
@@ -2893,8 +3376,8 @@ async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: Runti
     return;
   }
 
-  await writeScene(room, scene, config);
-  await broadcastUpdate(room, changed.length > 0 ? changed : scene, config, scene);
+  await writeSceneData(room, { elements, appState, files }, config);
+  await broadcastUpdate(room, changed.length > 0 ? changed : elements, config, elements);
   console.log(summaries.join("; "));
 }
 
@@ -2924,9 +3407,9 @@ async function commandExportImage(args: string[]): Promise<void> {
     usage();
   }
   const format = detectExportFormat(outPath, args);
-  const elements = await readScene(room, config);
-  const cropArea = parseCropArea(args, elements);
-  await exportSceneImage(elements, outPath, format, cropArea);
+  const scene = await readSceneData(room, config);
+  const cropArea = parseCropArea(args, scene.elements);
+  await exportSceneImage(scene.elements, scene.files, outPath, format, cropArea);
   console.log(
     cropArea
       ? `Exported ${format.toUpperCase()} crop ${cropArea.x},${cropArea.y},${cropArea.width},${cropArea.height} to ${outPath}`

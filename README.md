@@ -463,6 +463,52 @@ To create a background or section frame around existing elements, use `fitToIds`
 }
 ```
 
+### `addImage`
+
+```json
+{
+  "type": "addImage",
+  "id": "logo-image",
+  "x": 120,
+  "y": 320,
+  "width": 320,
+  "height": 180,
+  "path": "/tmp/logo.png"
+}
+```
+
+Use either `path` or `dataURL`. In ExcaliDash mode the CLI stores the required Excalidraw `files[fileId]` entry alongside the image element, so `dump`, `snapshot`, `restore`, `send-file`, and `export-image` preserve image data.
+
+### `addEmbeddable`
+
+```json
+{
+  "type": "addEmbeddable",
+  "id": "demo-embed",
+  "x": 520,
+  "y": 320,
+  "width": 420,
+  "height": 260,
+  "link": "https://example.com"
+}
+```
+
+Embeddable rendering depends on the Excalidraw host app's `validateEmbeddable` and `renderEmbeddable` configuration. Unsupported URLs still render as a linked embeddable placeholder.
+
+### `addFrame`
+
+```json
+{
+  "type": "addFrame",
+  "id": "main-frame",
+  "fitToIds": ["step-1-id", "step-2-id"],
+  "padding": 40,
+  "name": "Main flow"
+}
+```
+
+`addFrame` creates a native Excalidraw frame and assigns `frameId` to the elements listed in `fitToIds`.
+
 ### `addArrow`
 
 By coordinates:

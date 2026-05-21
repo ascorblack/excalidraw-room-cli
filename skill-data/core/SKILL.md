@@ -243,6 +243,9 @@ Transactions are simulated in order and written once. If any command is invalid,
 
 - `addRect`
 - `addText`
+- `addImage`
+- `addEmbeddable`
+- `addFrame`
 - `addArrow`
 - `move` (legacy op)
 - `delete` (legacy op)
@@ -253,7 +256,11 @@ Transactions are simulated in order and written once. If any command is invalid,
 - For multiline text in JSON, use `\n`, not `\\n`.
 - For labeled boxes, prefer `addRect` with `label`; by default the label is a bound container text and shares a group with the box.
 - For section backgrounds or frames, use `addRect` with `fitToIds`, `padding`, `labelPosition: "topLeft"`, and `layer: "back"` instead of manually guessing coordinates; top labels automatically reserve vertical space above the framed content.
+- Use `addFrame` when you need a native Excalidraw frame with `frameId` membership; use fitted `addRect` when you need a visual background band.
+- Use `addImage` with `path` or `dataURL` for images. `dump`, `snapshot`, `restore`, `send-file`, and `export-image` preserve `files` for ExcaliDash drawings.
+- Use `addEmbeddable` for web embeds, but remember rendering depends on the host app's embeddable validation rules.
 - For arrows between blocks, prefer `addArrow` with `fromId` and `toId`; this writes native Excalidraw bindings. Use `fromSide`/`toSide` (`left`, `right`, `top`, `bottom`, `center`) and `fromOffset`/`toOffset` (`0` to `1`) when the attachment point matters.
+- Set explicit `id` values on elements when a later op in the same payload must reference them.
 - `move` includes grouped elements by default, so moving a labeled box also moves its label. Use `includeGroup: false` only for a single-element move.
 - `elements.delete` creates tombstones so open clients see deletions immediately.
 - Full redraw is `elements.delete all` plus `elements.add` in one `commands` transaction.

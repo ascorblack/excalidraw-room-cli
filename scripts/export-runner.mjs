@@ -11,6 +11,7 @@ if (!scenePath || !bundlePath || !outPath || !format || !chromeBin) {
 
 const payload = JSON.parse(await fs.readFile(scenePath, "utf8"));
 const elements = payload.elements.filter((element) => !element.isDeleted);
+const files = payload.files ?? {};
 const cropArea = payload.cropArea ?? null;
 const EXPORT_PADDING = 20;
 
@@ -78,7 +79,7 @@ try {
   const cropRect = cropRectForExport(elements, cropArea);
 
   if (format === "svg") {
-    const svg = await page.evaluate(async ({ scene, cropRect }) => {
+    const svg = await page.evaluate(async ({ scene, files, cropRect }) => {
       const lib = window.__EXCALIDRAW_EXPORT_LIB__;
       const appState = {
         exportBackground: true,
@@ -90,19 +91,19 @@ try {
       const svgNode = await lib.exportToSvg({
         elements: scene,
         appState,
-          files: {},
-          exportPadding: 20,
-        });
+        files,
+        exportPadding: 20,
+      });
       if (cropRect) {
         svgNode.setAttribute("viewBox", `${cropRect.x} ${cropRect.y} ${cropRect.width} ${cropRect.height}`);
         svgNode.setAttribute("width", String(cropRect.width));
         svgNode.setAttribute("height", String(cropRect.height));
       }
       return svgNode.outerHTML;
-    }, { scene: elements, cropRect });
+    }, { scene: elements, files, cropRect });
     await fs.writeFile(outPath, svg, "utf8");
   } else if (format === "png") {
-    const pngBytes = await page.evaluate(async ({ scene, cropRect }) => {
+    const pngBytes = await page.evaluate(async ({ scene, files, cropRect }) => {
       const lib = window.__EXCALIDRAW_EXPORT_LIB__;
       const appState = {
         exportBackground: true,
@@ -114,7 +115,7 @@ try {
       const canvas = await lib.exportToCanvas({
         elements: scene,
         appState,
-        files: {},
+        files,
         exportPadding: 20,
       });
       let targetCanvas = canvas;
@@ -139,7 +140,7 @@ try {
       const pngBlob = await new Promise((resolve) => targetCanvas.toBlob(resolve, "image/png", 1));
       const buffer = await pngBlob.arrayBuffer();
       return Array.from(new Uint8Array(buffer));
-    }, { scene: elements, cropRect });
+    }, { scene: elements, files, cropRect });
     await fs.writeFile(outPath, Buffer.from(pngBytes));
   } else {
     throw new Error(`Unsupported format: ${format}`);
