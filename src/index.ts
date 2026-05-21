@@ -4,11 +4,22 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-type RoomRef = {
+type BackendMode = "room" | "excalidash";
+
+type ClassicRoomRef = {
+  backend: "room";
   roomId: string;
   roomKey: string;
   appUrl?: string;
 };
+
+type ExcalidashRoomRef = {
+  backend: "excalidash";
+  roomId: string;
+  appUrl: string;
+};
+
+type RoomRef = ClassicRoomRef | ExcalidashRoomRef;
 
 type CreatedRoom = RoomRef & {
   roomUrl: string;
@@ -138,17 +149,28 @@ type BasicAuthConfig = {
   password: string;
 };
 
+type ExcalidashAuthConfig = {
+  identifier: string;
+  password: string;
+};
+
 type CliConfig = {
+  backend?: BackendMode;
   appUrl?: string;
+  excalidashApiUrl?: string;
   wsServerUrl?: string;
   basicAuth?: BasicAuthConfig;
+  excalidashAuth?: ExcalidashAuthConfig;
 };
 
 type RuntimeConfig = {
+  backend: BackendMode;
   appUrl: string;
+  excalidashApiUrl: string;
   wsServerUrl: string;
   socketOrigin: string;
   basicAuth: BasicAuthConfig | null;
+  excalidashAuth: ExcalidashAuthConfig | null;
 };
 
 type AddRectSpec = {
@@ -245,6 +267,15 @@ type LegacyApplyJsonSpec =
 
 type ApplyJsonInput = LegacyApplyJsonSpec | ApplyJsonCommand | ApplyJsonTransaction;
 
+type ExcalidashDrawing = {
+  id: string;
+  name?: string;
+  elements?: ExcalidrawElement[];
+  appState?: Record<string, unknown>;
+  files?: Record<string, unknown>;
+  version?: number;
+};
+
 const FIREBASE_API_KEY = "AIzaSyAd15pYlMci_xIp9ko6wkEsDzAAA0Dn0RU";
 const FIREBASE_PROJECT_ID = "excalidraw-room-persistence";
 const DEFAULT_WS_SERVER_URL = "https://oss-collab.excalidraw.com";
@@ -268,6 +299,8 @@ const UPDATE_CHECK_TIMEOUT_MS = 1500;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const excalidashDrawingCache = new Map<string, ExcalidashDrawing>();
+let excalidashSessionPromise: Promise<ExcalidashSession> | null = null;
 
 function helpText(): string {
   return `Excalidraw Room CLI
@@ -278,9 +311,9 @@ Main commands:
   ${CLI_BIN_NAME} help
   ${CLI_BIN_NAME} version
   ${CLI_BIN_NAME} skill
-  ${CLI_BIN_NAME} config [show|path|set-app-url|set-ws-server-url|set-basic-auth|clear-basic-auth]
+  ${CLI_BIN_NAME} config [show|path|set-backend|set-app-url|set-ws-server-url|set-basic-auth|set-excalidash-auth|clear-basic-auth|clear-excalidash-auth]
   ${CLI_BIN_NAME} setup [--claude|--codex|--cursor|--universal|--all-agents]
-  ${CLI_BIN_NAME} create-room [--json] [--app-url <url>] [--ws-server-url <url>] [--basic-auth <user:password>]
+  ${CLI_BIN_NAME} create-room [--json] [--backend room|excalidash] [--app-url <url>] [--ws-server-url <url>] [--basic-auth <user:password>]
   ${CLI_BIN_NAME} status <roomUrl>
   ${CLI_BIN_NAME} dump <roomUrl> [out.json]
   ${CLI_BIN_NAME} watch <roomUrl>
@@ -302,13 +335,26 @@ Self-hosted Excalidraw:
   ${CLI_BIN_NAME} config set-ws-server-url https://collab.example.com
   ${CLI_BIN_NAME} create-room --json
 
+ExcaliDash:
+  ${CLI_BIN_NAME} config set-backend excalidash
+  ${CLI_BIN_NAME} config set-app-url https://hub.excalidraw.example.com
+  ${CLI_BIN_NAME} config set-excalidash-api-url http://127.0.0.1:6767
+  ${CLI_BIN_NAME} config set-excalidash-auth <email-or-username> <password>
+  ${CLI_BIN_NAME} create-room --json
+  ${CLI_BIN_NAME} apply-json https://hub.excalidraw.example.com/editor/<drawingId> spec.json
+
 Per-command overrides:
+  --backend <mode>        room (default) or excalidash
   --app-url <url>          Excalidraw app URL for generated room URLs and websocket Origin
+  --excalidash-api-url <url> ExcaliDash API/socket base URL; defaults to app URL
   --domain <url>           Alias for --app-url
   --ws-server-url <url>    Socket.IO collaboration server URL
   --basic-auth <u:p>       Basic Auth for websocket requests; saved to the global config
   --basic-auth-user <u>    Basic Auth username
   --basic-auth-password <p> Basic Auth password
+  --excalidash-auth <u:p> ExcaliDash local app login
+  --excalidash-user <u>   ExcaliDash local app username/email
+  --excalidash-password <p> ExcaliDash local app password
 
 apply-json input:
   - file path: apply-json <roomUrl> spec.json
@@ -473,12 +519,18 @@ function parseOptionalStringFlag(args: string[], flag: string): string | null {
 }
 
 const RUNTIME_VALUE_FLAGS = new Set([
+  "--backend",
+  "--name",
   "--app-url",
+  "--excalidash-api-url",
   "--domain",
   "--ws-server-url",
   "--basic-auth",
   "--basic-auth-user",
   "--basic-auth-password",
+  "--excalidash-auth",
+  "--excalidash-user",
+  "--excalidash-password",
 ]);
 
 function positionalArgs(args: string[]): string[] {
@@ -519,6 +571,13 @@ function normalizeWsServerUrl(value: string): string {
   return normalizeBaseUrl(value, "websocket server URL");
 }
 
+function normalizeBackendMode(value: string): BackendMode {
+  if (value === "room" || value === "excalidash") {
+    return value;
+  }
+  throw new Error("Backend must be room or excalidash");
+}
+
 async function readCliConfig(): Promise<CliConfig> {
   if (!(await Bun.file(CONFIG_PATH).exists())) {
     return {};
@@ -535,14 +594,23 @@ async function writeCliConfig(config: CliConfig): Promise<void> {
 
 function sanitizeCliConfig(config: CliConfig): CliConfig {
   const next: CliConfig = {};
+  if (config.backend) {
+    next.backend = normalizeBackendMode(config.backend);
+  }
   if (config.appUrl) {
     next.appUrl = normalizeAppUrl(config.appUrl);
+  }
+  if (config.excalidashApiUrl) {
+    next.excalidashApiUrl = normalizeAppUrl(config.excalidashApiUrl);
   }
   if (config.wsServerUrl) {
     next.wsServerUrl = normalizeWsServerUrl(config.wsServerUrl);
   }
   if (config.basicAuth) {
     next.basicAuth = normalizeBasicAuth(config.basicAuth.username, config.basicAuth.password);
+  }
+  if (config.excalidashAuth) {
+    next.excalidashAuth = normalizeExcalidashAuth(config.excalidashAuth.identifier, config.excalidashAuth.password);
   }
   return next;
 }
@@ -553,6 +621,12 @@ function redactConfig(config: CliConfig): CliConfig {
     basicAuth: config.basicAuth
       ? {
           username: config.basicAuth.username,
+          password: "<redacted>",
+        }
+      : undefined,
+    excalidashAuth: config.excalidashAuth
+      ? {
+          identifier: config.excalidashAuth.identifier,
           password: "<redacted>",
         }
       : undefined,
@@ -611,10 +685,17 @@ function basicAuthFromEnv(): BasicAuthConfig | null {
 
 async function resolveRuntimeConfig(args: string[], roomAppUrl?: string): Promise<RuntimeConfig> {
   const fileConfig = await readCliConfig();
+  const argBackend = parseOptionalStringFlag(args, "--backend");
   const argAppUrl = parseOptionalStringFlag(args, "--app-url") ?? parseOptionalStringFlag(args, "--domain");
+  const argExcalidashApiUrl = parseOptionalStringFlag(args, "--excalidash-api-url");
   const argWsServerUrl = parseOptionalStringFlag(args, "--ws-server-url");
   const argBasicAuth = basicAuthFromArgs(args);
+  const argExcalidashAuth = excalidashAuthFromArgs(args);
   const envBasicAuth = argBasicAuth ? null : basicAuthFromEnv();
+  const envExcalidashAuth = argExcalidashAuth ? null : excalidashAuthFromEnv();
+  const backend = normalizeBackendMode(
+    argBackend ?? process.env.EXCALIDRAW_ROOM_BACKEND ?? fileConfig.backend ?? "room",
+  );
 
   const appUrl = normalizeAppUrl(
     argAppUrl ??
@@ -622,6 +703,12 @@ async function resolveRuntimeConfig(args: string[], roomAppUrl?: string): Promis
       roomAppUrl ??
       fileConfig.appUrl ??
       DEFAULT_EXCALIDRAW_APP_URL,
+  );
+  const excalidashApiUrl = normalizeAppUrl(
+    argExcalidashApiUrl ??
+      process.env.EXCALIDRAW_ROOM_EXCALIDASH_API_URL ??
+      fileConfig.excalidashApiUrl ??
+      appUrl,
   );
   const wsServerUrl = normalizeWsServerUrl(
     argWsServerUrl ?? process.env.EXCALIDRAW_ROOM_WS_SERVER_URL ?? fileConfig.wsServerUrl ?? DEFAULT_WS_SERVER_URL,
@@ -631,26 +718,101 @@ async function resolveRuntimeConfig(args: string[], roomAppUrl?: string): Promis
       ? new URL(DEFAULT_EXCALIDRAW_APP_URL).origin
       : new URL(appUrl).origin;
   const basicAuth = argBasicAuth ?? envBasicAuth ?? fileConfig.basicAuth ?? null;
+  const excalidashAuth = argExcalidashAuth ?? envExcalidashAuth ?? fileConfig.excalidashAuth ?? null;
 
-  if (argAppUrl || argWsServerUrl || argBasicAuth) {
+  if (argBackend || argAppUrl || argExcalidashApiUrl || argWsServerUrl || argBasicAuth || argExcalidashAuth) {
     await writeCliConfig({
       ...fileConfig,
+      ...(argBackend ? { backend } : {}),
       ...(argAppUrl ? { appUrl } : {}),
+      ...(argExcalidashApiUrl ? { excalidashApiUrl } : {}),
       ...(argWsServerUrl ? { wsServerUrl } : {}),
       ...(argBasicAuth ? { basicAuth: argBasicAuth } : {}),
+      ...(argExcalidashAuth ? { excalidashAuth: argExcalidashAuth } : {}),
     });
   }
 
   return {
+    backend,
     appUrl,
+    excalidashApiUrl,
     wsServerUrl,
     socketOrigin,
     basicAuth,
+    excalidashAuth,
   };
 }
 
 function basicAuthHeader(credentials: BasicAuthConfig): string {
   return `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
+}
+
+function ensureNoProxyForLocalUrl(rawUrl: string): void {
+  const hostname = new URL(rawUrl).hostname;
+  if (hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "::1") {
+    return;
+  }
+  for (const key of ["NO_PROXY", "no_proxy"]) {
+    const current = process.env[key] ?? "";
+    const values = current.split(",").map((value) => value.trim()).filter(Boolean);
+    if (!values.includes(hostname)) {
+      values.push(hostname);
+    }
+    if (hostname === "127.0.0.1" && !values.includes("localhost")) {
+      values.push("localhost");
+    }
+    process.env[key] = values.join(",");
+  }
+}
+
+function normalizeExcalidashAuth(identifier: string, password: string): ExcalidashAuthConfig {
+  if (!identifier) {
+    throw new Error("ExcaliDash username/email must be non-empty");
+  }
+  if (!password) {
+    throw new Error("ExcaliDash password must be non-empty");
+  }
+  return { identifier, password };
+}
+
+function parseExcalidashAuthPair(value: string): ExcalidashAuthConfig {
+  const separator = value.indexOf(":");
+  if (separator <= 0) {
+    throw new Error("ExcaliDash auth must use user:password format");
+  }
+  return normalizeExcalidashAuth(value.slice(0, separator), value.slice(separator + 1));
+}
+
+function excalidashAuthFromArgs(args: string[]): ExcalidashAuthConfig | null {
+  const pair = parseOptionalStringFlag(args, "--excalidash-auth");
+  if (pair) {
+    return parseExcalidashAuthPair(pair);
+  }
+
+  const identifier = parseOptionalStringFlag(args, "--excalidash-user");
+  if (!identifier) {
+    return null;
+  }
+  const password = parseOptionalStringFlag(args, "--excalidash-password") ?? process.env.EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD;
+  if (!password) {
+    throw new Error("Missing --excalidash-password or EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD");
+  }
+  return normalizeExcalidashAuth(identifier, password);
+}
+
+function excalidashAuthFromEnv(): ExcalidashAuthConfig | null {
+  if (process.env.EXCALIDRAW_ROOM_EXCALIDASH_AUTH) {
+    return parseExcalidashAuthPair(process.env.EXCALIDRAW_ROOM_EXCALIDASH_AUTH);
+  }
+  const identifier = process.env.EXCALIDRAW_ROOM_EXCALIDASH_USER;
+  const password = process.env.EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD;
+  if (!identifier && !password) {
+    return null;
+  }
+  if (!identifier || !password) {
+    throw new Error("Set both EXCALIDRAW_ROOM_EXCALIDASH_USER and EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD");
+  }
+  return normalizeExcalidashAuth(identifier, password);
 }
 
 function defaultSkillInstallDirs(): string[] {
@@ -713,6 +875,14 @@ function resolveSkillInstallTargets(args: string[]): string[] {
 
 function parseRoomUrl(roomUrl: string): RoomRef {
   const url = new URL(roomUrl);
+  const editorMatch = url.pathname.match(/^\/editor\/([^/?#]+)$/);
+  if (editorMatch) {
+    return {
+      backend: "excalidash",
+      roomId: decodeURIComponent(editorMatch[1]),
+      appUrl: normalizeAppUrl(url.origin),
+    };
+  }
   const hash = url.hash;
   const match = hash.match(/^#room=([a-zA-Z0-9_-]+),([a-zA-Z0-9_-]+)$/);
   if (!match) {
@@ -720,6 +890,7 @@ function parseRoomUrl(roomUrl: string): RoomRef {
   }
   const pathname = url.pathname === "/" ? "" : url.pathname;
   return {
+    backend: "room",
     roomId: match[1],
     roomKey: match[2],
     appUrl: normalizeAppUrl(`${url.origin}${pathname}`),
@@ -732,13 +903,184 @@ function randomBase64Url(byteLength: number): string {
 }
 
 function formatRoomUrl(room: RoomRef, appUrl: string): string {
+  if (room.backend === "excalidash") {
+    return `${normalizeAppUrl(appUrl)}/editor/${encodeURIComponent(room.roomId)}`;
+  }
   return `${normalizeAppUrl(appUrl)}/#room=${room.roomId},${room.roomKey}`;
 }
 
 function createRoomRef(config: RuntimeConfig): CreatedRoom {
   const room = {
+    backend: "room" as const,
     roomId: randomBase64Url(ROOM_ID_BYTES),
     roomKey: randomBase64Url(ROOM_KEY_BYTES),
+    appUrl: config.appUrl,
+  };
+  return {
+    ...room,
+    roomUrl: formatRoomUrl(room, config.appUrl),
+  };
+}
+
+class CookieJar {
+  private values = new Map<string, string>();
+
+  absorb(headers: Headers): void {
+    const getSetCookie = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+    const rawCookies =
+      typeof getSetCookie === "function"
+        ? getSetCookie.call(headers)
+        : headers.get("set-cookie")
+          ? [headers.get("set-cookie") as string]
+          : [];
+
+    for (const rawCookie of rawCookies) {
+      for (const part of rawCookie.split(/,(?=[^;,]+=)/)) {
+        const pair = part.split(";", 1)[0]?.trim();
+        if (!pair) continue;
+        const separator = pair.indexOf("=");
+        if (separator <= 0) continue;
+        this.values.set(pair.slice(0, separator), pair.slice(separator + 1));
+      }
+    }
+  }
+
+  header(): string {
+    return [...this.values.entries()].map(([key, value]) => `${key}=${value}`).join("; ");
+  }
+}
+
+type ExcalidashSession = {
+  jar: CookieJar;
+  csrfHeader: string;
+  csrfToken: string;
+};
+
+function requireRuntimeConfig(config: RuntimeConfig | undefined, backend: BackendMode): RuntimeConfig {
+  if (!config) {
+    throw new Error(`${backend} runtime config is required`);
+  }
+  return config;
+}
+
+async function createExcalidashSession(config: RuntimeConfig): Promise<ExcalidashSession> {
+  if (!config.excalidashAuth) {
+    throw new Error("ExcaliDash auth is required. Use config set-excalidash-auth or EXCALIDRAW_ROOM_EXCALIDASH_AUTH.");
+  }
+  ensureNoProxyForLocalUrl(config.excalidashApiUrl);
+
+  const jar = new CookieJar();
+  const csrfResponse = await fetch(`${config.excalidashApiUrl}/api/csrf-token`, {
+    headers: { accept: "application/json" },
+  });
+  jar.absorb(csrfResponse.headers);
+  if (!csrfResponse.ok) {
+    throw new Error(`ExcaliDash CSRF request failed: ${csrfResponse.status} ${await csrfResponse.text()}`);
+  }
+  const csrf = (await csrfResponse.json()) as { token?: string; header?: string };
+  if (!csrf.token) {
+    throw new Error("ExcaliDash CSRF response did not include token");
+  }
+
+  const loginResponse = await fetch(`${config.excalidashApiUrl}/api/auth/login`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-csrf-token": csrf.token,
+      cookie: jar.header(),
+    },
+    body: JSON.stringify({
+      identifier: config.excalidashAuth.identifier,
+      password: config.excalidashAuth.password,
+    }),
+  });
+  jar.absorb(loginResponse.headers);
+  if (!loginResponse.ok) {
+    throw new Error(`ExcaliDash login failed: ${loginResponse.status} ${await loginResponse.text()}`);
+  }
+
+  return {
+    jar,
+    csrfHeader: csrf.header || "x-csrf-token",
+    csrfToken: csrf.token,
+  };
+}
+
+async function getExcalidashSession(config: RuntimeConfig): Promise<ExcalidashSession> {
+  if (!excalidashSessionPromise) {
+    excalidashSessionPromise = createExcalidashSession(config).catch((error) => {
+      excalidashSessionPromise = null;
+      throw error;
+    });
+  }
+  return excalidashSessionPromise;
+}
+
+async function excalidashFetch<T>(
+  config: RuntimeConfig,
+  apiPath: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const session = await getExcalidashSession(config);
+  const headers = new Headers(init.headers);
+  headers.set("accept", "application/json");
+  headers.set("cookie", session.jar.header());
+  if (init.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  if (init.method && init.method.toUpperCase() !== "GET") {
+    headers.set(session.csrfHeader, session.csrfToken);
+  }
+
+  const response = await fetch(`${config.excalidashApiUrl}/api${apiPath}`, {
+    ...init,
+    headers,
+  });
+  session.jar.absorb(response.headers);
+  if (!response.ok) {
+    throw new Error(`ExcaliDash API ${apiPath} failed: ${response.status} ${await response.text()}`);
+  }
+  return (await response.json()) as T;
+}
+
+async function readExcalidashDrawing(room: ExcalidashRoomRef, config: RuntimeConfig): Promise<ExcalidashDrawing> {
+  const drawing = await excalidashFetch<ExcalidashDrawing>(config, `/drawings/${encodeURIComponent(room.roomId)}`);
+  excalidashDrawingCache.set(room.roomId, drawing);
+  return drawing;
+}
+
+async function writeExcalidashDrawing(
+  room: ExcalidashRoomRef,
+  elements: ExcalidrawElement[],
+  config: RuntimeConfig,
+): Promise<void> {
+  const previous = excalidashDrawingCache.get(room.roomId) ?? (await readExcalidashDrawing(room, config));
+  const updated = await excalidashFetch<ExcalidashDrawing>(config, `/drawings/${encodeURIComponent(room.roomId)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      elements,
+      appState: previous.appState ?? {},
+      files: previous.files ?? {},
+      ...(typeof previous.version === "number" ? { version: previous.version } : {}),
+    }),
+  });
+  excalidashDrawingCache.set(room.roomId, updated);
+}
+
+async function createExcalidashDrawing(config: RuntimeConfig, name = "Untitled Drawing"): Promise<CreatedRoom> {
+  const response = await excalidashFetch<{ id: string }>(config, "/drawings", {
+    method: "POST",
+    body: JSON.stringify({
+      name,
+      collectionId: null,
+      elements: [],
+      appState: {},
+      files: {},
+    }),
+  });
+  const room: ExcalidashRoomRef = {
+    backend: "excalidash",
+    roomId: response.id,
     appUrl: config.appUrl,
   };
   return {
@@ -795,7 +1137,12 @@ async function decryptBytes(roomKey: string, iv: Uint8Array, ciphertext: Uint8Ar
   return decoder.decode(new Uint8Array(decrypted));
 }
 
-async function readScene(room: RoomRef): Promise<ExcalidrawElement[]> {
+async function readScene(room: RoomRef, config?: RuntimeConfig): Promise<ExcalidrawElement[]> {
+  if (room.backend === "excalidash") {
+    const drawing = await readExcalidashDrawing(room, requireRuntimeConfig(config, "excalidash"));
+    return drawing.elements ?? [];
+  }
+
   const url =
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}` +
     `/databases/(default)/documents/scenes/${room.roomId}?key=${FIREBASE_API_KEY}`;
@@ -817,7 +1164,12 @@ function getSceneVersion(elements: ExcalidrawElement[]): number {
   return elements.reduce((sum, element) => sum + element.version, 0);
 }
 
-async function writeScene(room: RoomRef, elements: ExcalidrawElement[]): Promise<void> {
+async function writeScene(room: RoomRef, elements: ExcalidrawElement[], config?: RuntimeConfig): Promise<void> {
+  if (room.backend === "excalidash") {
+    await writeExcalidashDrawing(room, elements, requireRuntimeConfig(config, "excalidash"));
+    return;
+  }
+
   const { ciphertext, iv } = await encryptJson(room.roomKey, elements);
   const url =
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}` +
@@ -1112,6 +1464,53 @@ async function encryptSocketPayload(roomKey: string, payload: SocketUpdate): Pro
 }
 
 async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement[], config: RuntimeConfig): Promise<void> {
+  if (room.backend === "excalidash") {
+    const session = await getExcalidashSession(config);
+    const socket = io(config.excalidashApiUrl, {
+      path: "/socket.io/",
+      transports: ["websocket"],
+      extraHeaders: {
+        Cookie: session.jar.header(),
+        Origin: new URL(config.appUrl).origin,
+      },
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("ExcaliDash socket join timed out")), 10_000);
+        socket.once("connect_error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+        socket.once("connect", () => {
+          socket.emit(
+            "join-room",
+            {
+              drawingId: room.roomId,
+              user: {
+                id: "excalidraw-room-cli",
+                name: "Excalidraw Room CLI",
+                initials: "CLI",
+                color: "#4f46e5",
+              },
+            },
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+          );
+        });
+      });
+      socket.emit("element-update", {
+        drawingId: room.roomId,
+        elements: changedElements,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    } finally {
+      socket.close();
+    }
+    return;
+  }
+
   const socket = await joinRoomSocket(room, config);
   try {
     const { encrypted, iv } = await encryptSocketPayload(room.roomKey, {
@@ -1126,7 +1525,7 @@ async function broadcastUpdate(room: RoomRef, changedElements: ExcalidrawElement
 }
 
 async function persistChange(room: RoomRef, change: SceneChange, config: RuntimeConfig): Promise<void> {
-  await writeScene(room, change.next);
+  await writeScene(room, change.next, config);
   await broadcastUpdate(room, change.changed, config);
   console.log(change.summary);
 }
@@ -1851,6 +2250,16 @@ async function commandConfig(args: string[]): Promise<void> {
     case "path":
       console.log(CONFIG_PATH);
       return;
+    case "set-backend": {
+      const backend = rest[0];
+      if (!backend) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config set-backend <room|excalidash>`);
+      }
+      const next = { ...config, backend: normalizeBackendMode(backend) };
+      await writeCliConfig(next);
+      console.log(`Saved backend ${next.backend}`);
+      return;
+    }
     case "set-app-url":
     case "set-domain": {
       const appUrl = rest[0];
@@ -1872,6 +2281,16 @@ async function commandConfig(args: string[]): Promise<void> {
       console.log(`Saved wsServerUrl ${next.wsServerUrl}`);
       return;
     }
+    case "set-excalidash-api-url": {
+      const excalidashApiUrl = rest[0];
+      if (!excalidashApiUrl) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config set-excalidash-api-url <url>`);
+      }
+      const next = { ...config, excalidashApiUrl: normalizeAppUrl(excalidashApiUrl) };
+      await writeCliConfig(next);
+      console.log(`Saved excalidashApiUrl ${next.excalidashApiUrl}`);
+      return;
+    }
     case "set-basic-auth": {
       const usernameOrPair = rest[0];
       if (!usernameOrPair) {
@@ -1886,11 +2305,35 @@ async function commandConfig(args: string[]): Promise<void> {
       console.log(`Saved Basic Auth username ${basicAuth.username}`);
       return;
     }
+    case "set-excalidash-auth": {
+      const identifierOrPair = rest[0];
+      if (!identifierOrPair) {
+        throw new Error(`Usage: ${CLI_BIN_NAME} config set-excalidash-auth <email-or-username> [password]`);
+      }
+      const excalidashAuth =
+        rest.length === 1 && identifierOrPair.includes(":")
+          ? parseExcalidashAuthPair(identifierOrPair)
+          : normalizeExcalidashAuth(
+              identifierOrPair,
+              rest[1] ?? process.env.EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD ?? "",
+            );
+      const next = { ...config, excalidashAuth };
+      await writeCliConfig(next);
+      console.log(`Saved ExcaliDash auth identifier ${excalidashAuth.identifier}`);
+      return;
+    }
     case "clear-basic-auth": {
       const next = { ...config };
       delete next.basicAuth;
       await writeCliConfig(next);
       console.log("Cleared Basic Auth");
+      return;
+    }
+    case "clear-excalidash-auth": {
+      const next = { ...config };
+      delete next.excalidashAuth;
+      await writeCliConfig(next);
+      console.log("Cleared ExcaliDash auth");
       return;
     }
     case "reset":
@@ -1899,7 +2342,7 @@ async function commandConfig(args: string[]): Promise<void> {
       return;
     default:
       throw new Error(
-        `Usage: ${CLI_BIN_NAME} config [show|path|set-app-url|set-ws-server-url|set-basic-auth|clear-basic-auth|reset]`,
+        `Usage: ${CLI_BIN_NAME} config [show|path|set-backend|set-app-url|set-ws-server-url|set-basic-auth|set-excalidash-auth|clear-basic-auth|clear-excalidash-auth|reset]`,
       );
   }
 }
@@ -1907,9 +2350,9 @@ async function commandConfig(args: string[]): Promise<void> {
 async function commandDump(args: string[]): Promise<void> {
   const values = positionalArgs(args);
   const room = parseRoomUrl(values[0] ?? usage());
-  await resolveRuntimeConfig(args, room.appUrl);
+  const config = await resolveRuntimeConfig(args, room.appUrl);
   const outPath = values[1];
-  const elements = await readScene(room);
+  const elements = await readScene(room, config);
   const json = JSON.stringify({ elements }, null, 2);
   if (outPath) {
     await Bun.write(outPath, json);
@@ -1922,8 +2365,8 @@ async function commandDump(args: string[]): Promise<void> {
 async function commandStatus(args: string[]): Promise<void> {
   const values = positionalArgs(args);
   const room = parseRoomUrl(values[0] ?? usage());
-  await resolveRuntimeConfig(args, room.appUrl);
-  const elements = await readScene(room);
+  const config = await resolveRuntimeConfig(args, room.appUrl);
+  const elements = await readScene(room, config);
   const live = elements.filter((element) => !element.isDeleted);
   console.log(summarizeScene(elements));
   for (const element of live.slice(0, 50)) {
@@ -1937,14 +2380,19 @@ async function commandStatus(args: string[]): Promise<void> {
 
 async function commandCreateRoom(args: string[]): Promise<void> {
   const config = await resolveRuntimeConfig(args);
-  const room = createRoomRef(config);
-  await writeScene(room, []);
+  const name = parseOptionalStringFlag(args, "--name") ?? "Untitled Drawing";
+  const room = config.backend === "excalidash" ? await createExcalidashDrawing(config, name) : createRoomRef(config);
+  if (room.backend === "room") {
+    await writeScene(room, [], config);
+  }
   if (args.includes("--json")) {
     console.log(JSON.stringify(room, null, 2));
     return;
   }
   console.log(`roomId ${room.roomId}`);
-  console.log(`roomKey ${room.roomKey}`);
+  if (room.backend === "room") {
+    console.log(`roomKey ${room.roomKey}`);
+  }
   console.log(`roomUrl ${room.roomUrl}`);
 }
 
@@ -1952,8 +2400,11 @@ async function commandWatch(args: string[]): Promise<void> {
   const values = positionalArgs(args);
   const room = parseRoomUrl(values[0] ?? usage());
   const config = await resolveRuntimeConfig(args, room.appUrl);
-  const initial = await readScene(room);
+  const initial = await readScene(room, config);
   console.log(`Initial scene: ${initial.length} elements`);
+  if (room.backend === "excalidash") {
+    throw new Error("watch is not supported for ExcaliDash yet; use status or dump to inspect the drawing");
+  }
 
   const socket = await joinRoomSocket(room, config);
   socket.on("client-broadcast", async (encryptedData: ArrayBuffer, iv: Uint8Array) => {
@@ -1971,9 +2422,9 @@ async function commandWatch(args: string[]): Promise<void> {
 async function commandSnapshot(args: string[]): Promise<void> {
   const values = positionalArgs(args);
   const room = parseRoomUrl(values[0] ?? usage());
-  await resolveRuntimeConfig(args, room.appUrl);
+  const config = await resolveRuntimeConfig(args, room.appUrl);
   const outPath = values[1] ?? snapshotDefaultPath(room);
-  const elements = await readScene(room);
+  const elements = await readScene(room, config);
   await Bun.$`mkdir -p ${path.dirname(outPath)}`.quiet();
   await Bun.write(outPath, JSON.stringify({ roomId: room.roomId, elements }, null, 2));
   console.log(`Saved snapshot to ${outPath}`);
@@ -1989,7 +2440,7 @@ async function commandRestore(args: string[]): Promise<void> {
   }
   const input = JSON.parse(await Bun.file(filePath).text());
   const elements = normalizeElementsFile(input);
-  const current = await readScene(room);
+  const current = await readScene(room, config);
   const change = buildReplaceScene(current, elements);
   await persistChange(room, { ...change, summary: `Restored ${elements.length} elements from ${filePath}` }, config);
 }
@@ -2071,18 +2522,18 @@ async function commandSendFile(args: string[]): Promise<void> {
   const mode = parseMode(args);
   const input = JSON.parse(await Bun.file(filePath).text());
   const incoming = normalizeElementsFile(input);
-  const current = await readScene(room);
+  const current = await readScene(room, config);
   if (mode === "replace") {
     await persistChange(room, { ...buildReplaceScene(current, incoming), summary: `Sent ${incoming.length} elements with mode=replace` }, config);
     return;
   }
-  await writeScene(room, [...current, ...incoming]);
+  await writeScene(room, [...current, ...incoming], config);
   await broadcastUpdate(room, incoming, config);
   console.log(`Sent ${incoming.length} elements with mode=append`);
 }
 
 async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: RuntimeConfig): Promise<void> {
-  const current = await readScene(room);
+  const current = await readScene(room, config);
   let scene = current;
   let changed: ExcalidrawElement[] = [];
   const summaries: string[] = [];
@@ -2144,7 +2595,7 @@ async function applyJsonSpec(room: RoomRef, input: ApplyJsonInput, config: Runti
     return;
   }
 
-  await writeScene(room, scene);
+  await writeScene(room, scene, config);
   await broadcastUpdate(room, changed.length > 0 ? changed : scene, config);
   console.log(summaries.join("; "));
 }
@@ -2169,13 +2620,13 @@ async function commandApplySpec(args: string[]): Promise<void> {
 async function commandExportImage(args: string[]): Promise<void> {
   const values = positionalArgs(args);
   const room = parseRoomUrl(values[0] ?? usage());
-  await resolveRuntimeConfig(args, room.appUrl);
+  const config = await resolveRuntimeConfig(args, room.appUrl);
   const outPath = values[1];
   if (!outPath) {
     usage();
   }
   const format = detectExportFormat(outPath, args);
-  const elements = await readScene(room);
+  const elements = await readScene(room, config);
   const cropArea = parseCropArea(args, elements);
   await exportSceneImage(elements, outPath, format, cropArea);
   console.log(

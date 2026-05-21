@@ -85,6 +85,31 @@ Environment overrides are available for automation:
 - `EXCALIDRAW_ROOM_BASIC_AUTH=user:password`
 - `EXCALIDRAW_ROOM_BASIC_AUTH_USER` and `EXCALIDRAW_ROOM_BASIC_AUTH_PASSWORD`
 
+## ExcaliDash
+
+The CLI can also target an ExcaliDash workspace instead of classic encrypted Excalidraw rooms:
+
+```bash
+excalidraw-room config set-backend excalidash
+excalidraw-room config set-app-url https://hub.excalidraw.example.com
+excalidraw-room config set-excalidash-auth "$EXCALIDASH_USER" "$EXCALIDASH_PASSWORD"
+```
+
+On the same host as ExcaliDash, you can keep public room URLs on the external domain while using a local API/socket path:
+
+```bash
+excalidraw-room config set-excalidash-api-url http://127.0.0.1:6767
+```
+
+In this mode `create-room --json` creates an ExcaliDash drawing and returns `/editor/<drawingId>`. `status`, `dump`, `snapshot`, `restore`, `send-file`, `apply-json`, and `export-image` work against ExcaliDash drawing URLs.
+
+Environment overrides:
+
+- `EXCALIDRAW_ROOM_BACKEND=excalidash`
+- `EXCALIDRAW_ROOM_EXCALIDASH_API_URL`
+- `EXCALIDRAW_ROOM_EXCALIDASH_AUTH=user:password`
+- `EXCALIDRAW_ROOM_EXCALIDASH_USER` and `EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD`
+
 ## Quick Start
 
 Create a new shared room:

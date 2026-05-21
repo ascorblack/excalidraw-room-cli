@@ -53,6 +53,24 @@ excalidraw-room config set-ws-server-url https://collab.example.com
 
 `config show` redacts the stored password. Do not put domains, room URLs, usernames, or passwords into committed files unless the user explicitly asks and the values are public.
 
+## ExcaliDash backend
+
+If the user wants project/folder storage through ExcaliDash, switch the CLI backend:
+
+```bash
+excalidraw-room config set-backend excalidash
+excalidraw-room config set-app-url https://hub.excalidraw.example.com
+EXCALIDRAW_ROOM_EXCALIDASH_PASSWORD='...' excalidraw-room config set-excalidash-auth "$EXCALIDASH_USER"
+```
+
+When running on the same host as ExcaliDash, set a local API URL while keeping public drawing URLs:
+
+```bash
+excalidraw-room config set-excalidash-api-url http://127.0.0.1:6767
+```
+
+ExcaliDash mode uses `/editor/<drawingId>` URLs. Use the same read/write commands as classic rooms.
+
 ## Create path
 
 If the user asks you to make a new room or does not provide a room URL, use:
