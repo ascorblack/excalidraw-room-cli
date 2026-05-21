@@ -40,9 +40,11 @@ type BoundElementRef = {
 
 type Binding = {
   elementId: string;
-  fixedPoint: [number, number];
-  mode: "inside" | "orbit";
+  focus: number;
+  gap: number;
 };
+
+type AnchorSide = "left" | "right" | "top" | "bottom" | "center";
 
 type ExcalidrawElement = {
   id: string;
@@ -185,6 +187,8 @@ type AddRectSpec = {
   labelFontSize?: number;
   labelColor?: string;
   labelFontFamily?: number;
+  bindLabel?: boolean;
+  groupLabel?: boolean;
 };
 
 type AddTextSpec = {
@@ -206,6 +210,12 @@ type AddArrowSpec = {
   y2?: number;
   fromId?: string;
   toId?: string;
+  fromSide?: AnchorSide;
+  toSide?: AnchorSide;
+  fromOffset?: number;
+  toOffset?: number;
+  startGap?: number;
+  endGap?: number;
   strokeColor?: string;
   endArrowhead?: string | null;
 };
@@ -222,6 +232,7 @@ type MoveSpec = {
   dy?: number;
   x?: number;
   y?: number;
+  includeGroup?: boolean;
 };
 
 type AgentSpec =
@@ -383,10 +394,10 @@ Spec formats:
      { "mode": "append|replace", "elements": [ ... ] }
 
 Supported operations:
-  addRect  { x, y, width, height, backgroundColor?, strokeColor?, label?, labelFontSize?, labelColor? }
+  addRect  { x, y, width, height, backgroundColor?, strokeColor?, label?, labelFontSize?, labelColor?, bindLabel?, groupLabel? }
   addText  { x, y, text, fontSize?, fontFamily?, strokeColor?, textAlign? }
-  addArrow { x1,y1,x2,y2 | fromId,toId, strokeColor?, endArrowhead? }
-  move     { id, dx?, dy?, x?, y? }
+  addArrow { x1,y1,x2,y2 | fromId,toId, fromSide?, toSide?, fromOffset?, toOffset?, startGap?, endGap?, strokeColor?, endArrowhead? }
+  move     { id, dx?, dy?, x?, y?, includeGroup? }
   delete   { ids: [...] }
   commands { elements.add | elements.update | elements.delete | elements.reorder }
 
@@ -1244,6 +1255,8 @@ function createBaseElement(args: {
   roughness?: number;
   opacity?: number;
   roundness?: { type: number } | null;
+  groupIds?: string[];
+  boundElements?: BoundElementRef[] | null;
   index: string;
 }): ExcalidrawElement {
   return {
@@ -1261,14 +1274,14 @@ function createBaseElement(args: {
     strokeStyle: args.strokeStyle ?? "solid",
     roughness: args.roughness ?? 1,
     opacity: args.opacity ?? 100,
-    groupIds: [],
+    groupIds: args.groupIds ?? [],
     frameId: null,
     roundness: args.roundness ?? null,
     seed: randomInt(),
     version: 1,
     versionNonce: randomInt(),
     isDeleted: false,
-    boundElements: null,
+    boundElements: args.boundElements ?? null,
     updated: now(),
     link: null,
     locked: false,
@@ -1283,6 +1296,8 @@ function createRectangle(args: {
   height: number;
   backgroundColor?: string;
   strokeColor?: string;
+  groupIds?: string[];
+  boundElements?: BoundElementRef[] | null;
   index: string;
 }): ExcalidrawElement {
   return createBaseElement({
@@ -1294,6 +1309,8 @@ function createRectangle(args: {
     backgroundColor: args.backgroundColor ?? "#a5d8ff",
     strokeColor: args.strokeColor ?? "#1e1e1e",
     roundness: { type: 3 },
+    groupIds: args.groupIds,
+    boundElements: args.boundElements,
     index: args.index,
   });
 }
@@ -1306,11 +1323,17 @@ function createText(args: {
   fontFamily?: number;
   strokeColor?: string;
   textAlign?: "left" | "center" | "right";
+  verticalAlign?: "top" | "middle" | "bottom";
+  width?: number;
+  height?: number;
+  autoResize?: boolean;
+  containerId?: string | null;
+  groupIds?: string[];
   index: string;
 }): ExcalidrawTextElement {
   const fontSize = args.fontSize ?? 20;
-  const width = estimateTextWidth(args.text, fontSize);
-  const height = estimateTextHeight(args.text, fontSize);
+  const width = args.width ?? estimateTextWidth(args.text, fontSize);
+  const height = args.height ?? estimateTextHeight(args.text, fontSize);
   const offsetX = args.textAlign === "center" ? width / 2 : args.textAlign === "right" ? width : 0;
 
   return {
@@ -1324,6 +1347,7 @@ function createText(args: {
       backgroundColor: "transparent",
       strokeWidth: 1,
       roughness: 0,
+      groupIds: args.groupIds,
       index: args.index,
     }),
     type: "text",
@@ -1331,10 +1355,10 @@ function createText(args: {
     fontSize,
     fontFamily: args.fontFamily ?? DEFAULT_FONT_FAMILY,
     textAlign: args.textAlign ?? "left",
-    verticalAlign: "top",
-    containerId: null,
+    verticalAlign: args.verticalAlign ?? "top",
+    containerId: args.containerId ?? null,
     originalText: args.text,
-    autoResize: true,
+    autoResize: args.autoResize ?? true,
     lineHeight: DEFAULT_LINE_HEIGHT,
   };
 }
@@ -1354,16 +1378,68 @@ function getElementCenter(element: ExcalidrawElement): { x: number; y: number } 
   };
 }
 
-function getAnchorForElement(element: ExcalidrawElement, side: "start" | "end"): AnchorPoint {
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeAnchorOffset(value: number | undefined): number {
+  return clamp(value ?? 0.5, 0, 1);
+}
+
+function resolveAutoAnchorSide(
+  element: ExcalidrawElement,
+  endpointRole: "start" | "end",
+  otherElement?: ExcalidrawElement,
+): AnchorSide {
+  if (!otherElement) {
+    return endpointRole === "start" ? "right" : "left";
+  }
   const center = getElementCenter(element);
-  const binding: Binding =
-    side === "start"
-      ? { elementId: element.id, fixedPoint: [1, 0.5], mode: "orbit" }
-      : { elementId: element.id, fixedPoint: [0, 0.5], mode: "orbit" };
+  const otherCenter = getElementCenter(otherElement);
+  const dx = otherCenter.x - center.x;
+  const dy = otherCenter.y - center.y;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0 ? "right" : "left";
+  }
+  return dy >= 0 ? "bottom" : "top";
+}
+
+function anchorPointOnElement(element: ExcalidrawElement, side: AnchorSide, offset: number | undefined): { x: number; y: number; focus: number } {
+  const normalizedOffset = normalizeAnchorOffset(offset);
+  const center = getElementCenter(element);
+  const focus = normalizedOffset * 2 - 1;
+
+  switch (side) {
+    case "left":
+      return { x: element.x, y: element.y + element.height * normalizedOffset, focus };
+    case "right":
+      return { x: element.x + element.width, y: element.y + element.height * normalizedOffset, focus };
+    case "top":
+      return { x: element.x + element.width * normalizedOffset, y: element.y, focus };
+    case "bottom":
+      return { x: element.x + element.width * normalizedOffset, y: element.y + element.height, focus };
+    case "center":
+      return { x: center.x, y: center.y, focus: 0 };
+  }
+}
+
+function getAnchorForElement(
+  element: ExcalidrawElement,
+  side: AnchorSide,
+  offset: number | undefined,
+  gap: number | undefined,
+): AnchorPoint {
+  const anchor = anchorPointOnElement(element, side, offset);
+  const center = getElementCenter(element);
+  const binding: Binding = {
+    elementId: element.id,
+    focus: side === "center" ? 0 : anchor.focus,
+    gap: Math.max(0, gap ?? 0),
+  };
 
   return {
-    x: side === "start" ? element.x + element.width : element.x,
-    y: center.y,
+    x: side === "center" ? center.x : anchor.x,
+    y: side === "center" ? center.y : anchor.y,
     binding,
     boundToId: element.id,
   };
@@ -1901,6 +1977,7 @@ async function exportSceneImage(
 }
 
 function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneChange {
+  const groupIds = spec.label && spec.groupLabel !== false ? [randomId()] : [];
   const rect = createRectangle({
     x: spec.x,
     y: spec.y,
@@ -1908,6 +1985,7 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
     height: spec.height,
     backgroundColor: spec.backgroundColor,
     strokeColor: spec.strokeColor,
+    groupIds,
     index: nextIndex(elements),
   });
   if (!spec.label) {
@@ -1918,19 +1996,31 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
     };
   }
 
+  const labelFontSize = spec.labelFontSize ?? 22;
+  const labelHeight = estimateTextHeight(spec.label, labelFontSize);
+  const bindLabel = spec.bindLabel !== false;
   const labelText = createText({
     x: rect.x + rect.width / 2,
-    y: rect.y + rect.height / 2 - estimateTextHeight(spec.label, spec.labelFontSize ?? 22) / 2,
+    y: rect.y + rect.height / 2 - labelHeight / 2,
     text: spec.label,
-    fontSize: spec.labelFontSize ?? 22,
+    fontSize: labelFontSize,
     fontFamily: spec.labelFontFamily ?? 2,
     strokeColor: spec.labelColor ?? spec.strokeColor ?? "#1e1e1e",
     textAlign: "center",
+    verticalAlign: bindLabel ? "middle" : "top",
+    width: bindLabel ? Math.max(8, rect.width - 24) : undefined,
+    height: bindLabel ? labelHeight : undefined,
+    autoResize: !bindLabel,
+    containerId: bindLabel ? rect.id : null,
+    groupIds,
     index: nextIndex([...elements, rect]),
   });
+  const finalRect = bindLabel
+    ? appendBoundElement(rect, { id: labelText.id, type: "text" })
+    : rect;
   return {
-    next: [...elements, rect, labelText],
-    changed: [rect, labelText],
+    next: [...elements, finalRect, labelText],
+    changed: [finalRect, labelText],
     summary: `Added labeled rectangle ${rect.id}`,
   };
 }
@@ -1958,11 +2048,16 @@ function resolveArrowEndpoint(
   side: "start" | "end",
   spec: AddArrowSpec,
 ): AnchorPoint {
-  if (side === "start" && spec.fromId) {
-    return getAnchorForElement(getElementById(elements, spec.fromId), "start");
+  const fromElement = spec.fromId ? getElementById(elements, spec.fromId) : null;
+  const toElement = spec.toId ? getElementById(elements, spec.toId) : null;
+
+  if (side === "start" && fromElement) {
+    const anchorSide = spec.fromSide ?? resolveAutoAnchorSide(fromElement, "start", toElement ?? undefined);
+    return getAnchorForElement(fromElement, anchorSide, spec.fromOffset, spec.startGap);
   }
-  if (side === "end" && spec.toId) {
-    return getAnchorForElement(getElementById(elements, spec.toId), "end");
+  if (side === "end" && toElement) {
+    const anchorSide = spec.toSide ?? resolveAutoAnchorSide(toElement, "end", fromElement ?? undefined);
+    return getAnchorForElement(toElement, anchorSide, spec.toOffset, spec.endGap);
   }
 
   const x = side === "start" ? spec.x1 : spec.x2;
@@ -2026,12 +2121,31 @@ function applyMove(elements: ExcalidrawElement[], spec: MoveSpec): SceneChange {
   const target = getElementById(elements, spec.id);
   const nextX = spec.x ?? target.x + (spec.dx ?? 0);
   const nextY = spec.y ?? target.y + (spec.dy ?? 0);
-  const moved = touchElement(target, { x: nextX, y: nextY });
-  const next = elements.map((element) => (element.id === moved.id ? moved : element));
+  const dx = nextX - target.x;
+  const dy = nextY - target.y;
+  const groupIds = spec.includeGroup === false ? [] : target.groupIds ?? [];
+  const movedIds = new Set<string>([target.id]);
+  if (groupIds.length > 0) {
+    for (const element of elements) {
+      if (!element.isDeleted && element.groupIds?.some((groupId) => groupIds.includes(groupId))) {
+        movedIds.add(element.id);
+      }
+    }
+  }
+
+  const changed: ExcalidrawElement[] = [];
+  const next = elements.map((element) => {
+    if (!movedIds.has(element.id)) {
+      return element;
+    }
+    const moved = touchElement(element, { x: element.x + dx, y: element.y + dy });
+    changed.push(moved);
+    return moved;
+  });
   return {
     next,
-    changed: [moved],
-    summary: `Moved ${moved.id} to (${Math.round(nextX)}, ${Math.round(nextY)})`,
+    changed,
+    summary: `Moved ${changed.length} element(s) by (${Math.round(dx)}, ${Math.round(dy)})`,
   };
 }
 

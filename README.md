@@ -420,9 +420,13 @@ Raw elements must be complete Excalidraw elements. `elements.add` fails when an 
   "strokeColor": "#1e1e1e",
   "label": "Agent\nentrypoint",
   "labelFontSize": 24,
-  "labelColor": "#1e1e1e"
+  "labelColor": "#1e1e1e",
+  "bindLabel": true,
+  "groupLabel": true
 }
 ```
+
+When `label` is set, the CLI binds the text to the rectangle as its container and puts both elements into one group by default. Set `bindLabel: false` or `groupLabel: false` only when you intentionally need a free-standing label.
 
 ### `addText`
 
@@ -460,9 +464,17 @@ Between existing elements:
   "type": "addArrow",
   "fromId": "left-card-id",
   "toId": "right-card-id",
+  "fromSide": "right",
+  "toSide": "left",
+  "fromOffset": 0.5,
+  "toOffset": 0.5,
+  "startGap": 4,
+  "endGap": 4,
   "strokeColor": "#1e1e1e"
 }
 ```
+
+When `fromId` or `toId` is used, the CLI writes native Excalidraw element bindings so the arrow stays attached in the editor. `fromSide` and `toSide` accept `left`, `right`, `top`, `bottom`, or `center`; if omitted, the side is chosen from the relative element positions. Offsets are normalized from `0` to `1` along the selected side.
 
 ### `move`
 
@@ -471,7 +483,8 @@ Between existing elements:
   "type": "move",
   "id": "element-id",
   "dx": 40,
-  "dy": 20
+  "dy": 20,
+  "includeGroup": true
 }
 ```
 
@@ -485,6 +498,8 @@ or:
   "y": 320
 }
 ```
+
+`move` includes grouped elements by default, so a labeled rectangle moves together with its label. Set `includeGroup: false` to move only the target element.
 
 ### `delete`
 
