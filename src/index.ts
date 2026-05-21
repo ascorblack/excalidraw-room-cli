@@ -45,6 +45,8 @@ type Binding = {
 };
 
 type AnchorSide = "left" | "right" | "top" | "bottom" | "center";
+type LabelPosition = "center" | "topLeft" | "topCenter" | "leftCenter";
+type ElementLayer = "front" | "back";
 
 type ExcalidrawElement = {
   id: string;
@@ -177,16 +179,21 @@ type RuntimeConfig = {
 
 type AddRectSpec = {
   type: "addRect";
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  fitToIds?: string[];
+  padding?: number;
   backgroundColor?: string;
   strokeColor?: string;
   label?: string;
   labelFontSize?: number;
   labelColor?: string;
   labelFontFamily?: number;
+  labelPosition?: LabelPosition;
+  labelPadding?: number;
+  layer?: ElementLayer;
   bindLabel?: boolean;
   groupLabel?: boolean;
 };
@@ -394,7 +401,7 @@ Spec formats:
      { "mode": "append|replace", "elements": [ ... ] }
 
 Supported operations:
-  addRect  { x, y, width, height, backgroundColor?, strokeColor?, label?, labelFontSize?, labelColor?, bindLabel?, groupLabel? }
+  addRect  { x,y,width,height | fitToIds,padding?, backgroundColor?, strokeColor?, label?, labelPosition?, layer?, bindLabel?, groupLabel? }
   addText  { x, y, text, fontSize?, fontFamily?, strokeColor?, textAlign? }
   addArrow { x1,y1,x2,y2 | fromId,toId, fromSide?, toSide?, fromOffset?, toOffset?, startGap?, endGap?, strokeColor?, endArrowhead? }
   move     { id, dx?, dy?, x?, y?, includeGroup? }
@@ -1227,6 +1234,15 @@ function nextIndex(elements: ExcalidrawElement[]): string {
   return generateKeyBetween(last, null);
 }
 
+function firstIndex(elements: ExcalidrawElement[]): string {
+  const indexes = elements
+    .map((element) => element.index)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const first = indexes.length > 0 ? indexes[0] : null;
+  return generateKeyBetween(null, first);
+}
+
 function now(): number {
   return Date.now();
 }
@@ -1839,6 +1855,37 @@ function boundsToCropArea(bounds: ElementBounds, padding: number): CropArea {
   };
 }
 
+function resolveRectGeometry(elements: ExcalidrawElement[], spec: AddRectSpec): { x: number; y: number; width: number; height: number } {
+  if (Array.isArray(spec.fitToIds)) {
+    if (spec.fitToIds.length === 0) {
+      throw new Error("addRect.fitToIds must be a non-empty array");
+    }
+    ensureUniqueStrings(spec.fitToIds, "fitToIds id");
+    const selected = spec.fitToIds.map((id) => getElementById(elements, id));
+    const bounds = mergeBounds(selected.map(getElementBounds));
+    const padding = spec.padding ?? 0;
+    if (!Number.isFinite(padding) || padding < 0) {
+      throw new Error("addRect.padding must be a non-negative number");
+    }
+    return {
+      x: bounds.minX - padding,
+      y: bounds.minY - padding,
+      width: bounds.maxX - bounds.minX + padding * 2,
+      height: bounds.maxY - bounds.minY + padding * 2,
+    };
+  }
+
+  if (spec.x == null || spec.y == null || spec.width == null || spec.height == null) {
+    throw new Error("addRect requires x, y, width, and height unless fitToIds is provided");
+  }
+  return {
+    x: spec.x,
+    y: spec.y,
+    width: spec.width,
+    height: spec.height,
+  };
+}
+
 async function pathExists(targetPath: string): Promise<boolean> {
   return await Bun.file(targetPath).exists();
 }
@@ -1976,40 +2023,119 @@ async function exportSceneImage(
   await Bun.$`node ${path.join(PACKAGE_ROOT, "scripts/export-runner.mjs")} ${tmpScenePath} ${path.resolve(bundlePath)} ${outPath} ${format} ${chromeBin}`.quiet();
 }
 
+function resolveLabelPlacement(
+  rect: ExcalidrawElement,
+  text: string,
+  fontSize: number,
+  position: LabelPosition,
+  padding: number,
+): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  textAlign: "left" | "center" | "right";
+  verticalAlign: "top" | "middle" | "bottom";
+} {
+  const measuredWidth = estimateTextWidth(text, fontSize);
+  const measuredHeight = estimateTextHeight(text, fontSize);
+  const innerWidth = Math.max(8, rect.width - padding * 2);
+
+  switch (position) {
+    case "topLeft":
+      return {
+        x: rect.x + padding,
+        y: rect.y + padding,
+        width: innerWidth,
+        height: measuredHeight,
+        textAlign: "left",
+        verticalAlign: "top",
+      };
+    case "topCenter":
+      return {
+        x: rect.x + rect.width / 2,
+        y: rect.y + padding,
+        width: innerWidth,
+        height: measuredHeight,
+        textAlign: "center",
+        verticalAlign: "top",
+      };
+    case "leftCenter": {
+      const width = Math.min(innerWidth, measuredWidth);
+      return {
+        x: rect.x + padding,
+        y: rect.y + rect.height / 2 - measuredHeight / 2,
+        width,
+        height: measuredHeight,
+        textAlign: "left",
+        verticalAlign: "middle",
+      };
+    }
+    case "center":
+      return {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2 - measuredHeight / 2,
+        width: innerWidth,
+        height: measuredHeight,
+        textAlign: "center",
+        verticalAlign: "middle",
+      };
+  }
+}
+
 function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneChange {
+  const geometry = resolveRectGeometry(elements, spec);
   const groupIds = spec.label && spec.groupLabel !== false ? [randomId()] : [];
+  const layer = spec.layer ?? "front";
+  if (layer !== "front" && layer !== "back") {
+    throw new Error("addRect.layer must be front or back");
+  }
   const rect = createRectangle({
-    x: spec.x,
-    y: spec.y,
-    width: spec.width,
-    height: spec.height,
+    x: geometry.x,
+    y: geometry.y,
+    width: geometry.width,
+    height: geometry.height,
     backgroundColor: spec.backgroundColor,
     strokeColor: spec.strokeColor,
     groupIds,
-    index: nextIndex(elements),
+    index: layer === "back" ? firstIndex(elements) : nextIndex(elements),
   });
   if (!spec.label) {
     return {
-      next: [...elements, rect],
+      next: layer === "back" ? [rect, ...elements] : [...elements, rect],
       changed: [rect],
       summary: `Added rectangle ${rect.id}`,
     };
   }
 
   const labelFontSize = spec.labelFontSize ?? 22;
-  const labelHeight = estimateTextHeight(spec.label, labelFontSize);
   const bindLabel = spec.bindLabel !== false;
+  const labelPosition = spec.labelPosition ?? "center";
+  if (!["center", "topLeft", "topCenter", "leftCenter"].includes(labelPosition)) {
+    throw new Error("addRect.labelPosition must be center, topLeft, topCenter, or leftCenter");
+  }
+  const labelPadding = spec.labelPadding ?? 12;
+  if (!Number.isFinite(labelPadding) || labelPadding < 0) {
+    throw new Error("addRect.labelPadding must be a non-negative number");
+  }
+  const labelPlacement = resolveLabelPlacement(
+    rect,
+    spec.label,
+    labelFontSize,
+    labelPosition,
+    labelPadding,
+  );
   const labelText = createText({
-    x: rect.x + rect.width / 2,
-    y: rect.y + rect.height / 2 - labelHeight / 2,
+    x: labelPlacement.x,
+    y: labelPlacement.y,
     text: spec.label,
     fontSize: labelFontSize,
     fontFamily: spec.labelFontFamily ?? 2,
     strokeColor: spec.labelColor ?? spec.strokeColor ?? "#1e1e1e",
-    textAlign: "center",
-    verticalAlign: bindLabel ? "middle" : "top",
-    width: bindLabel ? Math.max(8, rect.width - 24) : undefined,
-    height: bindLabel ? labelHeight : undefined,
+    textAlign: labelPlacement.textAlign,
+    verticalAlign: bindLabel ? labelPlacement.verticalAlign : "top",
+    width: bindLabel ? labelPlacement.width : undefined,
+    height: bindLabel ? labelPlacement.height : undefined,
     autoResize: !bindLabel,
     containerId: bindLabel ? rect.id : null,
     groupIds,
@@ -2018,8 +2144,9 @@ function applyAddRect(elements: ExcalidrawElement[], spec: AddRectSpec): SceneCh
   const finalRect = bindLabel
     ? appendBoundElement(rect, { id: labelText.id, type: "text" })
     : rect;
+  const next = layer === "back" ? [finalRect, ...elements, labelText] : [...elements, finalRect, labelText];
   return {
-    next: [...elements, finalRect, labelText],
+    next,
     changed: [finalRect, labelText],
     summary: `Added labeled rectangle ${rect.id}`,
   };

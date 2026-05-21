@@ -252,6 +252,7 @@ Transactions are simulated in order and written once. If any command is invalid,
 - Read before writing when existing ids or layout matter.
 - For multiline text in JSON, use `\n`, not `\\n`.
 - For labeled boxes, prefer `addRect` with `label`; by default the label is a bound container text and shares a group with the box.
+- For section backgrounds or frames, use `addRect` with `fitToIds`, `padding`, `labelPosition: "topLeft"`, and `layer: "back"` instead of manually guessing coordinates.
 - For arrows between blocks, prefer `addArrow` with `fromId` and `toId`; this writes native Excalidraw bindings. Use `fromSide`/`toSide` (`left`, `right`, `top`, `bottom`, `center`) and `fromOffset`/`toOffset` (`0` to `1`) when the attachment point matters.
 - `move` includes grouped elements by default, so moving a labeled box also moves its label. Use `includeGroup: false` only for a single-element move.
 - `elements.delete` creates tombstones so open clients see deletions immediately.

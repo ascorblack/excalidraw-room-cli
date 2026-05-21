@@ -421,12 +421,31 @@ Raw elements must be complete Excalidraw elements. `elements.add` fails when an 
   "label": "Agent\nentrypoint",
   "labelFontSize": 24,
   "labelColor": "#1e1e1e",
+  "labelPosition": "center",
   "bindLabel": true,
-  "groupLabel": true
+  "groupLabel": true,
+  "layer": "front"
 }
 ```
 
 When `label` is set, the CLI binds the text to the rectangle as its container and puts both elements into one group by default. Set `bindLabel: false` or `groupLabel: false` only when you intentionally need a free-standing label.
+
+To create a background or section frame around existing elements, use `fitToIds`. The rectangle is computed from the selected elements' bounding box plus `padding`; `layer: "back"` places the rectangle behind existing content while keeping its label visible.
+
+```json
+{
+  "type": "addRect",
+  "fitToIds": ["step-1-id", "step-2-id", "step-3-id"],
+  "padding": 32,
+  "backgroundColor": "#eef2ff",
+  "strokeColor": "#6366f1",
+  "label": "Основной поток",
+  "labelPosition": "topLeft",
+  "layer": "back"
+}
+```
+
+`labelPosition` accepts `center`, `topLeft`, `topCenter`, or `leftCenter`.
 
 ### `addText`
 
